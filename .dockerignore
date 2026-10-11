@@ -1,0 +1,13 @@
+# Nothing that is not needed to build the image, and above all nothing personal:
+# a development library or a sample photo must never be sent to a build.
+.git
+.github
+.venv
+.devdata
+sample-media
+docs
+ci
+dist
+build
+**/__pycache__
+**/*.pyc

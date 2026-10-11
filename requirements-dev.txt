@@ -1,0 +1,6 @@
+# Working on Waterfall on a machine with no ffmpeg of its own (a Mac, say).
+# Carries a static ffmpeg inside the project's own .venv, so nothing has to be
+# installed system-wide. The container uses Debian's ffmpeg instead and never
+# installs this.
+-r requirements.txt
+imageio-ffmpeg==0.6.0

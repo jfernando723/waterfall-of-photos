@@ -1,0 +1,138 @@
+# =============================================================================
+#  Build the Waterfall image, prove it, and (for a version tag) publish it.
+#
+#      1. Push a tag named  v<version>   (for example v0.5.0). The tag, the
+#         version in waterfall/__init__.py and the image named in
+#         docker-compose.yml must all agree, or nothing is built.
+#      2. The image is built. The Dockerfile runs the tests during the build,
+#         so an image whose tests fail cannot exist.
+#      3. ci/prove.sh starts it the way docker-compose.yml starts it (read-only,
+#         no capabilities, a named volume) and exercises it.
+#      4. It is saved as ONE file and loaded into Docker 24, the engine
+#         Synology's Container Manager uses, to prove an older engine can.
+#      5. For a tag, and only in the account the compose text points at: the
+#         image is pushed to GitHub's container registry and a Release is made
+#         with the file, its checksum, the compose text and the lists of what
+#         the image contains. A fork builds and proves, and publishes nothing.
+#
+#  It can also be run by hand (Actions -> Build -> Run workflow) to check that
+#  it still builds. That publishes nothing.
+#
+#  The job that builds holds no permission to publish. Only the second job
+#  does, and it runs nothing but the file the first one proved.
+# =============================================================================
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.what.outputs.version }}
+      image: ${{ steps.what.outputs.image }}
+      file: ${{ steps.what.outputs.file }}
+      publish: ${{ steps.what.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      - name: Work out what to build
+        id: what
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' waterfall/__init__.py)"
+          image="$(sed -n 's/^ *image: *\([^ ]*\).*/\1/p' docker-compose.yml)"
+          [[ -n "$version" && -n "$image" ]] || { echo "Could not read the version or the image name"; exit 1; }
+          # The compose text must ask for exactly the version being built, or the
+          # image people load will not be the one their project asks for.
+          [[ "$image" == *":$version" ]] || { echo "docker-compose.yml asks for $image but the code is $version"; exit 1; }
+          publish=no
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            [[ "$GITHUB_REF_NAME" == "v$version" ]] || { echo "Tag $GITHUB_REF_NAME but the code is $version"; exit 1; }
+            # Published only from the account the compose text points at. A
+            # fork builds and proves, and publishes nothing.
+            if [[ "$image" == "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/"* ]]; then
+              publish=yes
+            fi
+          fi
+          {
+            echo "version=$version"; echo "image=$image"; echo "publish=$publish"
+            echo "file=waterfall-$version.tar"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build (the Dockerfile runs the tests; a failing test fails the build)
+        run: |
+          docker build --pull --progress=plain \
+            --build-arg IMAGE_SOURCE="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --build-arg IMAGE_LICENSES="MIT AND GPL-2.0-or-later AND LGPL-3.0-or-later" \
+            -t "${{ steps.what.outputs.image }}" .
+
+      - name: Start it the way the compose file does, and exercise it
+        run: bash ci/prove.sh "${{ steps.what.outputs.image }}"
+
+      - name: Save as one file, with the lists of what is inside it
+        run: |
+          image="${{ steps.what.outputs.image }}"; file="${{ steps.what.outputs.file }}"; v="${{ steps.what.outputs.version }}"
+          docker save "$image" -o "$file"
+          sha256sum "$file" | tee "$file.sha256"
+          ls -l "$file"
+          cp docker-compose.yml "waterfall-$v-docker-compose.yml"
+          docker run --rm --entrypoint cat "$image" /app/DEBIAN-PACKAGES.tsv > "waterfall-$v-debian-packages.tsv"
+          docker run --rm --entrypoint cat "$image" /app/PYTHON-PACKAGES.txt > "waterfall-$v-python-packages.txt"
+
+      - name: Prove Docker 24 can load that file
+        run: bash ci/docker24.sh "${{ steps.what.outputs.file }}" "${{ steps.what.outputs.image }}"
+
+      - name: Keep the file with this run for a week
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: waterfall-${{ steps.what.outputs.version }}
+          path: |
+            ${{ steps.what.outputs.file }}
+            ${{ steps.what.outputs.file }}.sha256
+            waterfall-${{ steps.what.outputs.version }}-docker-compose.yml
+            waterfall-${{ steps.what.outputs.version }}-debian-packages.tsv
+            waterfall-${{ steps.what.outputs.version }}-python-packages.txt
+          retention-days: 7
+          compression-level: 6
+
+  publish:
+    needs: build
+    if: needs.build.outputs.publish == 'yes'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write        # to make the release
+      packages: write        # to push the image to ghcr.io
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          name: waterfall-${{ needs.build.outputs.version }}
+
+      - name: Check the file is the one that was proved, and load it
+        run: |
+          sha256sum -c "${{ needs.build.outputs.file }}.sha256"
+          docker load -i "${{ needs.build.outputs.file }}"
+
+      - name: Push to GitHub's container registry
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${{ needs.build.outputs.image }}"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ needs.build.outputs.version }}"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "Waterfall $v" \
+            --notes "Built and tested from this tag. Read the warning at the top of the README first: this is unreviewed, unsupported software. The image is \`${{ needs.build.outputs.image }}\`; the same image is attached as \`${{ needs.build.outputs.file }}\` for machines that cannot download it. The two package lists say exactly what the image contains; see THIRD-PARTY-NOTICES.md." \
+            "${{ needs.build.outputs.file }}" "${{ needs.build.outputs.file }}.sha256" \
+            "waterfall-$v-docker-compose.yml" "waterfall-$v-debian-packages.tsv" "waterfall-$v-python-packages.txt"

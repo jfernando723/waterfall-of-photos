@@ -1,0 +1,73 @@
+# Hand-made place names. A photo taken inside one of these circles is given this
+# name instead of the automatic one (see waterfall/places.py).
+#
+# One place per line, separated by TABS:
+#     name <TAB> country code <TAB> latitude <TAB> longitude <TAB> radius in km <TAB> note (optional)
+#
+# The name is shown exactly as written, followed by the country. Where circles
+# overlap, the one whose centre is nearest in proportion to its own radius wins,
+# so a small circle inside a large one still works.
+#
+# These entries were chosen by hand, by someone who knows the places. Each position was
+# checked against a second source before it was written down, and the note says which:
+# OSM = OpenStreetMap, GN = GeoNames, WP = Wikipedia. Three could not be, and say so:
+# two are marked ONE SOURCE and one ESTIMATED. GeoNames alone is not enough here: its
+# "Tokeh", "Kent" and "Tombo" all sit on one wrong spot in the middle of Waterloo.
+# A long beach, or a place with two parts, is two circles with the same name.
+
+# West coast of the Freetown peninsula, north to south. Beaches carry the word "Beach"; the two towns do not.
+Goderich	SL	8.4310	-13.2875	1.6	OSM suburb 8.4330,-13.2889; GN 8.4276,-13.2860
+Lakka Beach	SL	8.3935	-13.2655	0.8	OSM beach outline 8.3850-8.3980 N and hamlet 8.3981,-13.2656; GN Lakka 8.3989,-13.2684
+Hamilton Beach	SL	8.3820	-13.2590	1.1	OSM village 8.3827,-13.2595 and beach 8.3868,-13.2624; GN Hamilton 8.3823,-13.2605
+Sussex Beach	SL	8.3476	-13.2325	1.0	OSM beach 8.3484,-13.2346; GN Sussex 8.3468,-13.2306
+River No. 2 Beach	SL	8.3360	-13.2058	1.0	OSM beach 8.3354,-13.2054; GN Number Two Village 8.3367,-13.2060
+Tokeh Beach	SL	8.3125	-13.1955	1.9	OSM beach 8.3132,-13.1965 and village 8.3085,-13.1908; GN "Toke" 8.3079,-13.1905. NOT GN "Tokeh", which is wrongly at Waterloo
+York	SL	8.2853	-13.1797	1.2	OSM 8.2857,-13.1789; GN 8.2849,-13.1806
+Black Johnson Beach	SL	8.2678	-13.1643	1.1	ONE SOURCE: OSM village 8.2700,-13.1592 and beach club 8.2657,-13.1694; GN has no record
+John Obey Beach	SL	8.2470	-13.1620	1.4	OSM beach outline 8.2405-8.2552 N; WP 8.2455,-13.1642; village is GN "Williams Town" 8.2431,-13.1531
+Bureh Beach	SL	8.2040	-13.1570	1.2	OSM beach 8.2037,-13.1585 and Bureh Town 8.2037,-13.1545; GN "Bure Town" 8.2036,-13.1544
+
+# Inside Freetown. The centre of the city has no entry and still reads "Freetown".
+Lumley Beach	SL	8.4797	-13.2887	1.2	north half of the sand, from the OSM beach outline 8.4543-8.4933 N. GN has no beaches; Aberdeen (two sources) bounds this end
+Lumley Beach	SL	8.4641	-13.2816	1.2	south half of the sand, same outline; GN's Lumley neighbourhood 8.4606,-13.2698 is 1 km behind this end
+Aberdeen	SL	8.4945	-13.2865	1.0	OSM suburb 8.4955,-13.2867; GN 8.4912,-13.2849
+Murray Town	SL	8.4917	-13.2652	0.8	OSM 8.4916,-13.2653; GN 8.4919,-13.2650
+Wilberforce	SL	8.4745	-13.2660	0.9	OSM 8.4754,-13.2636; GN 8.4734,-13.2688; centre between
+Hill Station	SL	8.4591	-13.2546	0.8	OSM 8.4594,-13.2539; GN 8.4588,-13.2553
+Kissy	SL	8.4688	-13.1910	1.3	OSM suburb 8.4686,-13.1893; GN 8.4690,-13.1928
+Wellington	SL	8.4465	-13.1700	0.8	GN 8.4501,-13.1696; WP 8.4421,-13.1709; centre between. OSM has only the industrial estate
+Calaba Town	SL	8.4381	-13.1631	0.7	OSM 8.4381,-13.1631; GN 8.4387,-13.1633
+Allen Town	SL	8.4137	-13.1602	1.0	OSM 8.4136,-13.1603; GN 8.4138,-13.1600
+
+# The hills behind Freetown.
+Regent	SL	8.4353	-13.2182	1.0	OSM 8.4355,-13.2185; GN 8.4351,-13.2179
+Leicester	SL	8.4608	-13.2190	0.7	OSM 8.4611,-13.2187; GN 8.4604,-13.2192
+Leicester Peak	SL	8.4497	-13.2240	0.5	OSM peak 8.4496,-13.2238; GN 8.4499,-13.2241
+Gloucester	SL	8.4516	-13.2142	0.6	OSM 8.4522,-13.2139; GN 8.4509,-13.2146
+Charlotte	SL	8.4238	-13.1916	0.7	OSM 8.4235,-13.1911; GN 8.4241,-13.1922
+Bathurst	SL	8.4305	-13.1996	0.7	OSM 8.4312,-13.1999; GN 8.4298,-13.1993
+Tacugama	SL	8.4200	-13.2063	0.7	ONE SOURCE: OSM Tacugama Chimpanzee Sanctuary 8.4200,-13.2063. GN has Bathurst Falls 0.2 km and Kongo Dam 1.1 km away, which fits
+Guma Dam	SL	8.3640	-13.2030	1.5	dam: OSM 8.3601,-13.1996, GN 8.3598,-13.1993; OSM reservoir outline 8.3584-8.3747 N
+
+# Across the water, and the islands.
+Lungi	SL	8.6167	-13.1944	2.5	the airport: OSM outline 13.1754-13.2134 W; GN 8.6164,-13.1955
+Lungi	SL	8.6404	-13.2256	2.0	the town: OSM Lungi-Town 8.6402,-13.2266; GN 8.6406,-13.2245
+Tagrin	SL	8.5225	-13.1491	1.2	the ferry landing: OSM 8.5223,-13.1491; GN 8.5227,-13.1491
+Bunce Island	SL	8.5697	-13.0403	0.7	OSM 8.5697,-13.0403; GN 8.5698,-13.0407; WP 8.5699,-13.0402
+Tasso Island	SL	8.5529	-13.0733	2.4	OSM island outline 8.5374-8.5683 N; GN 8.5547,-13.0744
+Banana Islands	SL	8.1199	-13.2150	4.5	both islands as one name: OSM outlines of Dublin and Ricketts islands 8.0978-8.1419 N; GN 8.1154,-13.2139; WP 8.1167,-13.2167
+
+# The road east, Freetown to Masiaka. Sized so that the highway no longer reads "Freetown" beyond Hastings.
+Jui	SL	8.4105	-13.1315	1.7	OSM 8.4092,-13.1334; GN 8.4121,-13.1293; centre between
+Grafton	SL	8.3945	-13.1544	1.0	OSM 8.3950,-13.1550; GN 8.3940,-13.1537
+Hastings	SL	8.3806	-13.1379	2.2	OSM 8.3813,-13.1389; GN 8.3799,-13.1369
+Rokel	SL	8.3803	-13.1040	1.6	OSM 8.3788,-13.1028; GN 8.3819,-13.1051; centre between
+Devil Hole	SL	8.3720	-13.0936	0.8	OSM 8.3735,-13.0938; GN 8.3705,-13.0933
+Newton	SL	8.3375	-13.0060	3.0	OSM 8.3363,-13.0071; GN 8.3388,-13.0048
+Songo	SL	8.3685	-12.9327	6.2	OSM 8.3685,-12.9327; GN 8.3684,-12.9328. Wide because the highway passes 2.8 km from the village
+Mile 38	SL	8.4497	-12.8597	6.2	ESTIMATED, no record anywhere: 2 miles along the highway past OSM's Mile 36 (8.4331,-12.8800). Mile 36 to Masiaka (Mile 47) measures 10.96 miles
+Masiaka	SL	8.4906	-12.7575	3.5	OSM 8.4909,-12.7574; GN 8.4903,-12.7576. NOT WP's 8.7667,-12.7875, which is Port Loko
+
+# Up-country.
+Mandia	SL	9.9751	-11.8511	2.0	OSM 9.9751,-11.8510; GN 9.9751,-11.8512; the one near the Guinea border
+Tiwai	SL	7.5456	-11.3498	3.6	the island and the Kambama landing: OSM island outline 7.5158-7.5754 N; GN 7.5444,-11.3493; WP 7.5441,-11.3488

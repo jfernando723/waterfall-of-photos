@@ -1,0 +1,27 @@
+Place names in Waterfall
+========================
+
+places.tsv.gz and countries.tsv in this folder are derived from the GeoNames
+geographical database:
+
+    GeoNames            https://www.geonames.org/
+    Licence             Creative Commons Attribution 4.0 International (CC BY 4.0)
+                        https://creativecommons.org/licenses/by/4.0/
+    Source files        https://download.geonames.org/export/dump/
+                        (one of the "cities" lists, countryInfo.txt and, in
+                        some copies, whole-country files)
+
+Changes made to the GeoNames data: only populated places are kept; districts
+inside a city and abandoned, destroyed or seasonal places are left out; each
+place is reduced to five columns (country code, name, latitude, longitude,
+population); coordinates are rounded to four decimal places. The script that
+does this is scripts/make-places.py.
+
+GeoNames provides the data "as is", without warranty of any kind. GeoNames does
+not endorse Waterfall.
+
+places-preferred.tsv is not from GeoNames. It is a hand-made list of name,
+position and radius. Each position in it was chosen by hand and then checked
+against other maps, and its notes say which: OpenStreetMap (data (c)
+OpenStreetMap contributors, Open Database Licence,
+https://www.openstreetmap.org/copyright), GeoNames (as above) and Wikipedia.

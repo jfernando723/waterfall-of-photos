@@ -1,0 +1,90 @@
+# Waterfall — paste this into your NAS's container screen, or save it as
+# docker-compose.yml and run `docker compose up -d`.
+#
+# On a Synology: Container Manager -> Project -> Create -> Source: "Create
+# docker-compose.yml", and paste everything below.
+#
+# WHAT THIS CAN REACH ON YOUR MACHINE: no folder of yours, and the video chip.
+#
+# There is no line here pointing at a shared folder, and that absence is the
+# whole safety design. Your photos and videos are COPIED into Waterfall through
+# its import door (any WebDAV client; on a Synology, File Station -> Tools ->
+# Remote Connection). They then live in `waterfall-data`, a Docker NAMED volume
+# that Docker keeps in its own storage. It is not one of your shares, and your
+# file manager cannot see inside it.
+#
+# COPY, NEVER MOVE: once a file is converted Waterfall removes its full-size
+# copy and keeps the small ones. What you moved in would be gone.
+
+services:
+  waterfall:
+    image: ghcr.io/jfernando723/waterfall-of-photos:0.5.0
+    container_name: waterfall
+    restart: unless-stopped
+
+    ports:
+      # The wall. If something already uses 7275, change ONLY the left number.
+      # Keep this on your own network or a VPN. Do not forward it from the
+      # internet: it speaks plain http and shows the Visible wall to anyone.
+      - "7275:7275"
+      # The import door. `127.0.0.1` means only this machine itself can reach
+      # it, which is all a NAS's own file manager needs. Nothing else on your
+      # network can. To copy from another computer instead, remove
+      # `127.0.0.1:` -- and know that the admin password then crosses your
+      # network unencrypted every time a file is copied.
+      - "127.0.0.1:7276:7276"
+
+    volumes:
+      - waterfall-data:/data          # named volume, NOT a shared folder
+
+    # The machine's Intel video chip. It makes converting 4K video several
+    # times faster. It is a decoder, not storage: nothing of yours is
+    # reachable through it.
+    # IF THE PROJECT WILL NOT START and the error mentions /dev/dri (a machine
+    # with no Intel chip, for one), delete these two lines and build again;
+    # Waterfall then converts in software and says so on its admin page.
+    devices:
+      - /dev/dri:/dev/dri
+    # If the admin page says the chip is there but may not be used, it names a
+    # group number. Remove the two `#` below and put that number in:
+    # group_add:
+    #   - "109"
+
+    environment:
+      # Your time zone, for example Europe/London or America/New_York. It only
+      # matters for a file that carries no time zone of its own; phone photos
+      # and videos carry theirs.
+      TZ: Etc/UTC
+      # Optional. Sets the admin password on the very first start, so that
+      # nobody else on your network can reach the set-up page before you do.
+      # Ignored once a password exists; delete the line afterwards.
+      # WATERFALL_ADMIN_PASSWORD: "choose-a-long-one"
+      # Optional. Keep the full-size files as well as the small copies.
+      # WATERFALL_KEEP_ORIGINALS: "1"
+
+    # ---- containment ----------------------------------------------------
+    # The image already runs as a non-root user, so there is no `user:` line
+    # here -- one less thing for a NAS's screens to disagree with.
+    read_only: true                  # the image's own filesystem is immutable
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # ---- limits ---------------------------------------------------------
+    # Converting 4K video is heavy. It runs at low priority so the machine's
+    # real work always wins, and these stop it ever being the reason the
+    # machine runs short. On a machine with 4 GB or less, try 2g.
+    mem_limit: 3g
+    pids_limit: 512
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "3"
+
+volumes:
+  waterfall-data:

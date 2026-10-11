@@ -1,0 +1,26 @@
+# Working files
+.DS_Store
+._*
+__pycache__/
+*.pyc
+.venv/
+.devdata/
+dist/
+build/
+
+# ---------------------------------------------------------------------------
+# Personal photos and videos must NEVER be committed here. The tests generate
+# their own stand-in media; nothing real is needed, and nothing real is wanted.
+# The only pictures in this repository are the screenshots under docs/, which
+# are PNG and were made from that generated media.
+# ---------------------------------------------------------------------------
+sample-media/
+*.[hH][eE][iI][cC]
+*.[hH][eE][iI][fF]
+*.[mM][oO][vV]
+*.[mM][pP]4
+*.[mM]4[vV]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[dD][nN][gG]
+*.[wW][eE][bB][pP]

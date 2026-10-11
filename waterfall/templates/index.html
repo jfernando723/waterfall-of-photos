@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="robots" content="noindex, nofollow">
+<title>Waterfall</title>
+<link rel="stylesheet" href="/static/app.css?v={{ v }}">
+</head>
+<body>
+
+<!-- Only ever shown for first-run set-up, or if a viewing password has been set. -->
+<main id="gate" hidden>
+  <form id="gate-form" class="card" autocomplete="off">
+    <h1>Waterfall</h1>
+    <p id="gate-lead" class="muted"></p>
+    <label id="gate-label" for="gate-password">Password</label>
+    <input id="gate-password" type="password" autocomplete="current-password" required>
+    <p id="gate-error" class="error" role="alert"></p>
+    <button type="submit" id="gate-submit">Continue</button>
+  </form>
+</main>
+
+<!-- The wall: every item, or one section, as a grid that never ends. -->
+<div id="wall" hidden>
+  <header class="bar" id="bar">
+    <button id="open-sections" class="title" aria-haspopup="dialog">
+      <span id="realm-tag" class="realm-tag" hidden>Hidden</span>
+      <span id="title-text">Everything</span>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <span id="wall-count" class="muted small"></span>
+    <button id="open-settings" class="icon" aria-label="Settings and admin">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>
+    </button>
+  </header>
+  <div class="chips">
+    <div id="kind" class="chip-group" role="group" aria-label="Show">
+      <button data-kind="all" aria-pressed="true">All</button>
+      <button data-kind="photo" aria-pressed="false">Photos</button>
+      <button data-kind="video" aria-pressed="false">Videos</button>
+    </div>
+    <div class="segmented" id="order" role="group" aria-label="Order">
+      <button data-order="shuffle" aria-pressed="true">Shuffle</button>
+      <button data-order="new" aria-pressed="false">Newest</button>
+      <button data-order="old" aria-pressed="false">Oldest</button>
+    </div>
+  </div>
+  <div id="grid" class="grid"></div>
+  <p id="wall-status" class="muted center"></p>
+  <div id="sentinel"></div>
+</div>
+
+<!-- The viewer: one item per screen, swipe up for the next. Everything it
+     draws over the picture sits in one thin row along the bottom edge. -->
+<div id="viewer" hidden>
+  <div id="deck" class="deck"><div id="deck-size"></div></div>
+  <button id="viewer-close" class="float top-left" aria-label="Back to the grid">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+  </button>
+  <div class="foot">
+    <button id="viewer-section" class="pill"></button>
+    <span id="viewer-time" class="time" hidden></span>
+    <span class="spacer"></span>
+    <button id="viewer-sound" class="float small" aria-label="Sound" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path id="sound-icon" d=""/></svg>
+    </button>
+    <button id="viewer-info" class="float small" aria-label="Details">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg>
+    </button>
+  </div>
+  <div id="scrub" class="scrub" hidden><div id="scrub-fill"></div></div>
+</div>
+
+<!-- Sheets slide up from the bottom, one at a time. Close by tapping outside
+     or by dragging the sheet down. -->
+<div id="backdrop" hidden></div>
+<section id="sheet" class="sheet" role="dialog" aria-modal="true" hidden>
+  <div id="sheet-grip" class="sheet-grip" role="button" aria-label="Close"><div class="sheet-handle"></div></div>
+  <div id="sheet-body"></div>
+</section>
+
+<script src="/static/app.js?v={{ v }}" defer></script>
+</body>
+</html>

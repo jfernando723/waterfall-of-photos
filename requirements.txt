@@ -1,0 +1,19 @@
+# Every package is pinned to an exact version, including the ones Flask brings
+# with it, so that the image built today is the image built next month, and a
+# new release of anything arrives only when someone chooses it here.
+#
+# Flask and waitress are pure Python. Pillow and pillow-heif ship compiled
+# wheels for Linux (x86-64 and arm64) with libheif and its HEVC decoder inside,
+# which is what lets the container read phone HEIC photos with no apt packages.
+# What those wheels bundle, and on what terms, is in THIRD-PARTY-NOTICES.md.
+Flask==3.1.0
+waitress==3.0.2
+pillow==12.3.0
+pillow_heif==1.8.0
+# Brought in by Flask.
+blinker==1.9.0
+click==8.5.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+Werkzeug==3.1.9
