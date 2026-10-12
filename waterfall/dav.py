@@ -29,13 +29,17 @@ half a video is never converted and never shown.
 from __future__ import annotations
 
 import base64
+import collections
 import mimetypes
 import os
+import re
 import secrets
 import shutil
+import sys
 import threading
 import time
 import urllib.parse
+import uuid
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape
@@ -50,9 +54,27 @@ SMALL = 4 * CHUNK               # the most that is read from someone who has not
 # limit was spent and the converter could no longer start. A file manager
 # copying folders uses a handful.
 MAX_CLIENTS = 32
+# Connections beyond those wait their turn instead of being turned away: a
+# waiting connection is a socket and nothing else, no thread. Together that is
+# five hundred at once, so a bulk copy of several hundred files started in one
+# go is served in order with none refused. Past that, the door hangs up.
+MAX_WAITING = 468
+WAIT_LIMIT = 300                # seconds: one that has waited this long has given up anyway
 ALLOW = "OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, LOCK, UNLOCK, PROPPATCH"
 
 _on_change = lambda: None       # set by serve(): "something arrived, look again soon"
+
+
+def _say(line: str) -> None:
+    """One line in the log, which on a NAS is the only place to look when a
+    file manager will not copy something in. Never a file or folder name: the
+    log is not behind the admin password."""
+    print("import door: " + line, flush=True)
+
+
+def _plain(text: str, most: int) -> str:
+    """Something a client sent, made safe to print."""
+    return "".join(c if 32 <= ord(c) < 127 else "?" for c in str(text)[:most])
 
 
 class Refuse(Exception):
@@ -97,18 +119,37 @@ def _props(parts: list[str], path: str) -> str:
             f"<D:getlastmodified>{formatdate(st.st_mtime, usegmt=True)}</D:getlastmodified>"
             f"<D:creationdate>{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(st.st_mtime))}</D:creationdate>"
             "<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope>"
-            "<D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>")
+            "<D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>"
+            # Whoever holds the admin password may do everything here. Said
+            # outright, because a client that asks and is told nothing may
+            # conclude it is allowed nothing.
+            + _MAY)
     if is_dir:
-        body += "<D:resourcetype><D:collection/></D:resourcetype>"
+        # How much room there is, in the form clients ask for it. One that is
+        # told nothing may show, or assume, none.
+        room = shutil.disk_usage(path)
+        body += ("<D:resourcetype><D:collection/></D:resourcetype>"
+                 f"<D:quota-available-bytes>{max(0, room.free - SPARE)}</D:quota-available-bytes>"
+                 f"<D:quota-used-bytes>{room.used}</D:quota-used-bytes>")
     else:
         kind = mimetypes.guess_type(name)[0] or "application/octet-stream"
         body += ("<D:resourcetype/>"
                  f"<D:getcontentlength>{st.st_size}</D:getcontentlength>"
                  f"<D:getcontenttype>{kind}</D:getcontenttype>"
-                 f'<D:getetag>"{st.st_size:x}-{st.st_mtime_ns:x}"</D:getetag>')
+                 f"<D:getetag>{_etag(st)}</D:getetag>")
     return (f"<D:response><D:href>{escape(_href(parts, is_dir))}</D:href><D:propstat>"
             f"<D:prop>{body}</D:prop><D:status>HTTP/1.1 200 OK</D:status>"
             "</D:propstat></D:response>")
+
+
+_MAY = ("<D:current-user-privilege-set>" + "".join(
+    f"<D:privilege><D:{p}/></D:privilege>" for p in (
+        "read", "write", "write-properties", "write-content", "bind", "unbind", "unlock",
+        "read-current-user-privilege-set")) + "</D:current-user-privilege-set>")
+
+
+def _etag(st) -> str:
+    return f'"{st.st_size:x}-{st.st_mtime_ns:x}"'
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -119,8 +160,57 @@ class Handler(BaseHTTPRequestHandler):
     # that stalls does not hold a thread (and a half-written file) for ever.
     timeout = 300
 
+    _why = ""       # why this request was answered as it was, for the log
+    _asked = b""    # the start of a small request body, kept only while WATERFALL_DAV_LOG is on
+
     def log_message(self, *args):       # the admin page is the place for status
         pass
+
+    def log_request(self, code="-", size="-"):
+        """Called once for every answer. A refusal is always written to the
+        log; an ordinary answer only when WATERFALL_DAV_LOG asks for it. A
+        missing file is ordinary (clients ask before they write), and so is
+        the first request of a client that waits to be asked for the password."""
+        try:
+            status = int(code)
+        except (TypeError, ValueError):
+            return
+        headers = getattr(self, "headers", None)
+        sent_password = bool(headers and headers.get("Authorization"))
+        looking = getattr(self, "command", None) in ("GET", "HEAD", "PROPFIND")
+        routine = status < 400 or (status == 404 and looking) or (status == 401 and not sent_password)
+        if config.DAV_LOG or not routine:
+            _say(self._described(status))
+
+    def _described(self, status: int) -> str:
+        """What was asked and what was answered, without any name in it."""
+        headers = getattr(self, "headers", None) or {}
+        path = urllib.parse.urlsplit(getattr(self, "path", "") or "").path
+        bits = [f"{_plain(getattr(self, 'command', None) or '?', 12)} answered {status}"]
+        if self._why:
+            bits.append(self._why)
+        bits.append(f"{len([p for p in path.split('/') if p])} folders deep")
+        size = headers.get("Content-Length") or headers.get("X-Expected-Entity-Length")
+        if size:
+            bits.append(f"{_plain(size, 20)} bytes announced")
+        for name in ("Transfer-Encoding", "Expect", "Content-Range", "Depth", "Overwrite",
+                     "If-Match", "If-None-Match"):
+            if headers.get(name):
+                bits.append(f"{name}: {_plain(headers[name], 40)}")
+        if self._asked:
+            # The names of what was asked for (properties, a lock), never the
+            # text between them: that can hold a user name or a file name.
+            names = []
+            for name in re.findall(r"<(?:[\w.-]+:)?([\w.-]+)", self._asked.decode("latin-1")):
+                if name not in names and name not in ("xml", "propfind", "prop"):
+                    names.append(name)
+            if names:
+                bits.append("asks for: " + _plain(" ".join(names), 300))
+        if not headers.get("Authorization"):
+            bits.append("no password sent")
+        if headers.get("User-Agent"):
+            bits.append(f"client: {_plain(headers['User-Agent'], 60)}")
+        return ", ".join(bits)
 
     # -- plumbing -------------------------------------------------------------
     def _send(self, status: int, body: bytes = b"", content_type: str = "text/plain; charset=utf-8",
@@ -182,8 +272,9 @@ class Handler(BaseHTTPRequestHandler):
                 yield piece
 
     def _drain(self) -> None:
-        for _ in self._body():
-            pass
+        for piece in self._body():
+            if config.DAV_LOG and len(self._asked) < 4096:
+                self._asked += piece[:4096 - len(self._asked)]
 
     def _drain_if_small(self) -> None:
         """Read a small body so that the client hears the answer rather than a
@@ -201,6 +292,7 @@ class Handler(BaseHTTPRequestHandler):
         """Admin password or nothing. The username is ignored: clients insist
         on asking for one, and Waterfall has none."""
         if not auth.is_configured():
+            self._why = "no admin password has been chosen yet"
             self.close_connection = True
             self._send(503, b"Open Waterfall in a browser and choose the admin password first.\n",
                        headers={"Connection": "close"})
@@ -211,9 +303,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 password = base64.b64decode(header[6:]).decode("utf-8").split(":", 1)[1]
             except Exception:
-                password = None
-        if password is not None and auth.check_admin(password, self.client_address[0]):
-            return True
+                self._why = "the password sent could not be read"
+        elif header:
+            self._why = "a kind of sign-in the door does not offer: " + _plain(header.split(" ", 1)[0], 20)
+        if password is not None:
+            wait = auth.throttled(self.client_address[0])
+            if auth.check_admin(password, self.client_address[0]):
+                return True
+            self._why = (f"too many wrong passwords from this address, {wait} seconds to wait"
+                         if wait else "wrong password")
         self._drain_if_small()
         self.close_connection = True
         self._send(401, b"The Waterfall admin password is needed.\n",
@@ -221,22 +319,35 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _run(self, action) -> None:
+        self._why, self._asked = "", b""
+        try:
+            self._answer(action)
+        except (ConnectionError, TimeoutError):
+            # The client went away, mid-request or while being answered.
+            self.close_connection = True
+            _say(f"{_plain(self.command or '?', 12)} ended early, the client went away"
+                 + (f" ({self._why})" if self._why else ""))
+
+    def _answer(self, action) -> None:
         try:
             if self.command != "OPTIONS" and not self._allowed():
                 return
             action()
         except Refuse as no:
             self.close_connection = True
+            self._why = no.message
             self._send(no.status, (no.message + "\n").encode(), headers={"Connection": "close"})
         except (ConnectionError, TimeoutError):
-            self.close_connection = True
+            raise
         except ValueError:
             # A body that does not follow the rules it announced. Nothing was kept.
             self.close_connection = True
+            self._why = "the upload did not follow the size it announced"
             self._send(400, b"That upload was malformed.\n", headers={"Connection": "close"})
         except OSError as exc:
             self.close_connection = True
             status = 507 if exc.errno == 28 else 500        # 28: no space left on device
+            self._why = exc.strerror or type(exc).__name__
             self._send(status, f"{exc.strerror or exc}\n".encode(), headers={"Connection": "close"})
 
     def _inside(self, parts: list[str], verb: str) -> None:
@@ -279,11 +390,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, b"Waterfall import. Connect with a WebDAV client.\n")
         if not os.path.isfile(path):
             raise Refuse(404, "Not found.")
-        size = os.path.getsize(path)
+        st = os.stat(path)
         self.send_response(200)
         self.send_header("Content-Type", mimetypes.guess_type(path)[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(size))
-        self.send_header("Last-Modified", formatdate(os.path.getmtime(path), usegmt=True))
+        self.send_header("Content-Length", str(st.st_size))
+        self.send_header("Last-Modified", formatdate(st.st_mtime, usegmt=True))
+        self.send_header("ETag", _etag(st))
         self.end_headers()
         if self.command == "HEAD":
             return
@@ -328,19 +440,23 @@ class Handler(BaseHTTPRequestHandler):
             # A leading dot keeps the half-arrived file out of listings and out
             # of the scanner's sight; the rename at the end is atomic.
             temp = os.path.join(folder, f".{parts[-1]}.part-{secrets.token_hex(4)}")
+            got = 0
             try:
                 with open(temp, "wb") as f:
                     for piece in self._body():
                         f.write(piece)
+                        got += len(piece)
                 os.replace(temp, path)
             except BaseException:
+                self._why = f"{got} of {expected} bytes had arrived" if expected else f"{got} bytes had arrived"
                 try:
                     os.remove(temp)
                 except OSError:
                     pass
                 raise
+            self._why = f"{got} bytes kept"
             _on_change()
-            self._send(204 if existed else 201)
+            self._send(204 if existed else 201, headers={"ETag": _etag(os.stat(path))})
         self._run(go)
 
     def do_DELETE(self):
@@ -408,7 +524,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise Refuse(409, "The folder above it does not exist.")
                 open(path, "ab").close()
                 created = True
-            token = f"opaquelocktoken:{secrets.token_hex(16)}"
+            token = f"opaquelocktoken:{uuid.uuid4()}"
             xml = ('<?xml version="1.0" encoding="utf-8"?><D:prop xmlns:D="DAV:"><D:lockdiscovery>'
                    "<D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/>"
                    "</D:lockscope><D:depth>infinity</D:depth><D:timeout>Second-3600</D:timeout>"
@@ -439,26 +555,80 @@ class Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
 
     def __init__(self, *args, **kwargs):
-        self._slots = threading.BoundedSemaphore(MAX_CLIENTS)
+        self._turns = threading.Lock()
+        self._most, self._most_waiting = MAX_CLIENTS, MAX_WAITING
+        self._serving = 0
+        self._waiting: collections.deque = collections.deque()
+        self._last_full = 0.0
         super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
-        if not self._slots.acquire(blocking=False):
-            self.shutdown_request(request)      # full: hang up at once, hold nothing
+        with self._turns:
+            if self._serving >= self._most:
+                if len(self._waiting) < self._most_waiting:
+                    self._waiting.append((request, client_address, time.monotonic()))
+                    return
+                full = True
+            else:
+                self._serving += 1
+                full = False
+        if full:
+            # Full, and the waiting room too: hang up at once, hold nothing.
+            if time.monotonic() - self._last_full > 30:
+                self._last_full = time.monotonic()
+                _say(f"turned a connection away: {self._most} being served and {self._most_waiting} waiting")
+            self.shutdown_request(request)
             return
+        if not self._begin(request, client_address):
+            self._next()                # it never started: its place is free again
+
+    def _begin(self, request, client_address) -> bool:
         try:
             super().process_request(request, client_address)
-        except BaseException:
-            self._slots.release()
-            raise
+            return True
+        except Exception:
+            self.shutdown_request(request)
+            return False
+
+    def _next(self) -> None:
+        """A connection has finished. Its place goes to whoever has waited
+        longest, or is given back if nobody is waiting."""
+        while True:
+            with self._turns:
+                if not self._waiting:
+                    self._serving -= 1
+                    return
+                request, client_address, since = self._waiting.popleft()
+            if time.monotonic() - since > WAIT_LIMIT:
+                self.shutdown_request(request)
+                continue
+            if self._begin(request, client_address):
+                return
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._slots.release()
+            self._next()
+
+    def handle_error(self, request, client_address):
+        # A client that goes away between requests is its own business, not a
+        # fault worth a page of traceback in the log.
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            if config.DAV_LOG:
+                _say("a client went away between requests")
+            return
+        super().handle_error(request, client_address)
+
+    def server_close(self):
+        with self._turns:
+            waiting, self._waiting = list(self._waiting), collections.deque()
+        for request, _, _ in waiting:
+            self.shutdown_request(request)
+        super().server_close()
 
 
 def serve(on_change=None, bind: str | None = None, port: int | None = None) -> _Server:

@@ -187,15 +187,61 @@ def _settle(address: str, mark: float, role: str | None) -> None:
                 _FAILS.pop(address, None)
 
 
+# The import door is sent the password with every request, and a file manager
+# copying a folder sends many requests at once. Checked the slow way each time,
+# every one of them cost a slow check, and each was counted as a guess while it
+# was being checked: a seventh arriving beside six others was refused although
+# its password was right, and the file manager reported a permission error.
+# So a password that has passed the slow check is remembered, for as long as
+# this process runs and only as a keyed digest, and recognised at once after
+# that. Nothing else changes: a wrong password is still counted before it is
+# checked, and an address that is waiting still waits, right password or not.
+_PROOF_KEY = secrets.token_bytes(32)
+_PROVEN: dict[str, bytes] = {}      # the stored admin hash -> digest of the password that matched it
+_SLOW_CHECK = threading.Lock()
+
+
+def _digest(password: str) -> bytes:
+    return hmac.new(_PROOF_KEY, password.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _proven(password: str, stored: str | None) -> bool:
+    known = _PROVEN.get(stored) if stored else None
+    return known is not None and hmac.compare_digest(known, _digest(password))
+
+
+def _forgive(address: str) -> None:
+    """A right admin password wipes the address's slate, as _settle does."""
+    if address in _FAILS:
+        with _FAIL_LOCK:
+            _FAILS.pop(address, None)
+
+
 def check_admin(password: str, address: str) -> bool:
     """For the import door, which only the admin password opens. Wrong
     guesses there count against the same limit as wrong guesses at sign-in."""
-    mark = _begin(address)
-    if mark is None:
+    stored = library.get_setting("admin_hash")
+    if throttled(address):
         return False
-    good = _matches(password, library.get_setting("admin_hash"))
-    _settle(address, mark, "admin" if good else None)
-    return good
+    if _proven(password, stored):
+        _forgive(address)
+        return True
+    # One slow check at a time. Requests that arrive together with the right
+    # password wait here behind the first, then pass on the line below instead
+    # of each being counted as a guess.
+    with _SLOW_CHECK:
+        if _proven(password, stored):
+            _forgive(address)
+            return True
+        mark = _begin(address)
+        if mark is None:
+            return False
+        good = _matches(password, stored)
+        _settle(address, mark, "admin" if good else None)
+        if good:
+            _PROVEN.clear()             # a changed password has a new stored hash
+            _PROVEN[stored] = _digest(password)
+        return good
 
 
 def check(password: str, address: str) -> str | None:

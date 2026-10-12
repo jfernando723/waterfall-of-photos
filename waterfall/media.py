@@ -656,6 +656,60 @@ def _preview(source: str, target: str, duration: float) -> int:
     return os.path.getsize(target)
 
 
+# The moving half of a Live Photo: a clip of two or three seconds that a phone
+# records around a still. It is kept as one small file beside the still's own
+# copies and played when the photo is pressed. One size is enough: it is
+# fetched only when asked for, and it is over before a second size could help.
+LIVE_SHORT = 1080
+LIVE_LONGEST = 4.0          # seconds: anything longer is a video somebody took
+
+
+def make_live(path: str, target: str, fps: float | None = None) -> dict:
+    """Make the small moving copy of a Live Photo's clip. Always in software:
+    three seconds of video is not worth the video chip's ways of going wrong."""
+    info = video_frame_info(path)
+    short = min(info["width"], info["height"])
+    scale = min(LIVE_SHORT, short) / short
+    w = max(2, int(round(info["width"] * scale / 2)) * 2)
+    h = max(2, int(round(info["height"] * scale / 2)) * 2)
+    chain = _head(SOFTWARE, info, fps, w, h)
+    chain.append(_TONEMAP if info["trc"] in HDR_TRANSFERS else "format=yuv420p")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    temp = target + ".part"
+    cmd = [_ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+    if config.FFMPEG_THREADS:
+        cmd += ["-threads", str(config.FFMPEG_THREADS)]
+    cmd += _FROM_OUTSIDE + ["-i", path, "-map", "0:v:0", "-vf", ",".join(chain)]
+    if info["has_audio"]:
+        cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000"]
+    cmd += ["-c:v", "libx264", "-preset", config.X264_PRESET, "-profile:v", "high", "-crf", "23",
+            "-maxrate", "6000k", "-bufsize", "12000k", "-pix_fmt", "yuv420p",
+            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+            "-map_metadata", "-1", "-movflags", "+faststart", "-f", "mp4", temp]
+
+    def lower_priority():
+        try:
+            os.nice(config.NICE)
+        except OSError:
+            pass
+
+    run = subprocess.run(cmd, capture_output=True, text=True, timeout=600, preexec_fn=lower_priority)
+    try:
+        if run.returncode != 0 or not os.path.exists(temp) or not os.path.getsize(temp):
+            tail = " | ".join(run.stderr.strip().splitlines()[-2:])
+            raise MediaError(f"could not make the Live Photo's moving copy: {tail[:300]}")
+        made = video_frame_info(temp)
+        if (made["width"], made["height"]) != (w, h):
+            raise MediaError(f"the Live Photo's moving copy came out {made['width']}x{made['height']}")
+        os.replace(temp, target)
+    finally:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+    return {"bytes": os.path.getsize(target), "w": w, "h": h, "has_audio": info["has_audio"]}
+
+
 def _playlist_stats(playlist: str) -> tuple[float, int]:
     """-> (duration in seconds, the busiest segment's bitrate in bits/s).
 

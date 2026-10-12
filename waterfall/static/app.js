@@ -15,6 +15,10 @@
       one an item is on is decided by the folder it was put in, not here.
    5. An item has one home, its folder. A tag lets it appear in another
       category as well, without a second copy of the file.
+   6. A Live Photo is a photo that also has a short clip. It is shown as the
+      photo; holding a finger on it, or tapping LIVE, plays the clip over it.
+   7. The admin can send files from this page, a few megabytes at a time, so a
+      phone can add to the library without anything else installed.
 */
 (() => {
   'use strict';
@@ -260,7 +264,7 @@
       data.items.forEach((item, i) => addTile(item, base + i));
       if (!state.items.length) {
         $('wall-status').textContent = isAdmin()
-          ? 'Nothing here yet. Photos and videos are copied in through the import door; the steps are under the ··· menu.'
+          ? 'Nothing here yet. Add photos and videos from the ··· menu.'
           : 'Nothing here yet.';
       } else if (!state.more) {
         $('wall-status').textContent = 'That is everything.';
@@ -290,6 +294,8 @@
     if (item.k === 'v') {
       tile.appendChild(el('span', 'badge', fmtClock(item.d)));
       if (item.p) previewWatcher.observe(tile);
+    } else if (item.lv) {
+      tile.appendChild(el('span', 'badge live', 'LIVE'));
     }
     // Always add to the shortest column, so the wall grows evenly and nothing
     // already on screen ever moves when more arrives.
@@ -493,13 +499,18 @@
     return slide;
   }
 
+  // A video slide's own video. A photo slide can hold one too, the clip of a
+  // Live Photo, and nothing that plays, pauses or sizes "the video" means that.
+  const mainVideo = (slide) => (slide ? slide.querySelector('video:not(.live)') : null);
+
   function dropSlide(index) {
     const slide = slides.get(index);
     if (!slide) return;
     // A dropped video has its source cleared first, or iOS keeps its decoder
     // (it allows few).
-    const video = slide.querySelector('video');
-    if (video) { video.pause(); video.removeAttribute('src'); video.load(); }
+    for (const video of slide.querySelectorAll('video')) {
+      video.pause(); video.removeAttribute('src'); video.load();
+    }
     slide.remove();
     slides.delete(index);
   }
@@ -551,8 +562,7 @@
     }
     // The very next video also starts buffering, so it plays the moment it
     // is reached. Only one, so a quick flick past it wastes little.
-    const next = slides.get(state.current + 1);
-    const video = next && next.querySelector('video');
+    const video = mainVideo(slides.get(state.current + 1));
     if (video && prefs.ahead > 0 && video.preload !== 'auto') {
       video.preload = 'auto';
       video.load();
@@ -560,8 +570,7 @@
   }
 
   function currentVideo() {
-    const slide = slides.get(state.current);
-    return slide ? slide.querySelector('video') : null;
+    return mainVideo(slides.get(state.current));
   }
 
   function setCurrent(index) {
@@ -570,14 +579,17 @@
     state.current = index;
     renderWindow();
     for (const [i, slide] of slides) {
-      const video = slide.querySelector('video');
+      stopLive(slide);
+      const video = mainVideo(slide);
       if (!video) continue;
       if (i === index) playCurrent(video, slide);
       else { video.pause(); slide.classList.remove('is-paused'); }
     }
     const item = state.items[index];
     $('viewer-section').textContent = sectionName(item.s);
-    $('viewer-sound').hidden = item.k !== 'v';
+    $('viewer-live').hidden = !item.lv;
+    $('viewer-sound').hidden = item.k !== 'v' && !item.lv;
+    updateSoundIcon();
     $('scrub').hidden = item.k !== 'v';
     $('viewer-time').hidden = item.k !== 'v';
     $('viewer-time').textContent = item.k === 'v' ? `0:00 / ${fmtClock(item.d)}` : '';
@@ -638,10 +650,62 @@
   const SOUND_OFF = 'M4 9v6h4l5 4V5L8 9H4zM16.5 9.5l5 5M21.5 9.5l-5 5';
   function updateSoundIcon() {
     const video = currentVideo();
-    const audible = !!video && !video.muted;
+    const item = state.items[state.current];
+    // A Live Photo has nothing playing most of the time: its button shows
+    // what its clip will do when it is played.
+    const audible = video ? !video.muted : !!(item && item.lv && state.wantSound);
     $('sound-icon').setAttribute('d', audible ? SOUND_ON : SOUND_OFF);
     $('viewer-sound').classList.toggle('on', audible);
   }
+
+  // ----------------------------------------------------------- live photos --
+  // The clip is one small file, fetched the first time it is asked for and
+  // kept while the slide lives. It is laid exactly over the photo, inside the
+  // layer that zooming moves, and fades in once it is really playing, so a
+  // slow link shows the still for a moment longer rather than a black frame.
+  let liveHold = 0;                   // timer: a finger resting on a Live Photo
+  let liveHeld = false;               // the clip is playing because a finger is down
+
+  function playLive(slide) {
+    const item = state.items[Number(slide.dataset.index)];
+    if (!item || !item.lv) return;
+    let clip = slide.querySelector('video.live');
+    if (!clip) {
+      clip = el('video', 'live');
+      clip.playsInline = true;
+      clip.setAttribute('playsinline', '');
+      clip.disableRemotePlayback = true;
+      clip.preload = 'auto';
+      clip.addEventListener('playing', () => { if (slide.classList.contains('live-on')) clip.classList.add('in'); });
+      clip.addEventListener('ended', () => stopLive(slide));
+      clip.addEventListener('error', () => stopLive(slide));
+      clip.src = murl(item, 'live.mp4');
+      slide.querySelector('.zoom').appendChild(clip);
+    }
+    slide.classList.add('live-on');
+    $('viewer-live').classList.add('on');
+    clip.muted = !state.wantSound;
+    try { clip.currentTime = 0; } catch { /* not loaded yet: it starts at the start anyway */ }
+    const attempt = clip.play();
+    if (attempt && attempt.catch) {
+      attempt.catch(() => {
+        clip.muted = true;              // refused with sound: play it silent rather than not at all
+        clip.play().catch(() => stopLive(slide));
+      });
+    }
+  }
+  function stopLive(slide) {
+    if (!slide || !slide.classList.contains('live-on')) return;
+    slide.classList.remove('live-on');
+    $('viewer-live').classList.remove('on');
+    const clip = slide.querySelector('video.live');
+    if (clip) { clip.classList.remove('in'); clip.pause(); }
+  }
+  $('viewer-live').addEventListener('click', () => {
+    const slide = slides.get(state.current);
+    if (!slide) return;
+    if (slide.classList.contains('live-on')) stopLive(slide); else playLive(slide);
+  });
 
   function openViewer(index) {
     stopAllPreviews();
@@ -728,6 +792,8 @@
     holdDeck(false);
     zoom.touches.clear();
     zoom.pinch = zoom.drag = null;
+    clearTimeout(liveHold);
+    if (liveHeld) { liveHeld = false; stopLive(zoom.slide); }
     zoom.slide = zoom.layer = null;
   }
   function sharpenForZoom() {
@@ -742,6 +808,7 @@
     return { x: event.clientX - box.left, y: event.clientY - box.top };
   }
   function startPinch() {
+    clearTimeout(liveHold);
     const [a, b] = [...zoom.touches.values()];
     zoom.pinch = { gap: Math.hypot(a.x - b.x, a.y - b.y) || 1, s: zoom.s, x: zoom.x, y: zoom.y,
                    cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2 };
@@ -760,6 +827,18 @@
     }
     zoom.touches.set(event.pointerId, pointIn(event));
     zoom.moved = false;
+    // A finger resting on a Live Photo plays its clip for as long as it rests.
+    clearTimeout(liveHold);
+    if (zoom.touches.size === 1 && zoom.s === 1 && slide.querySelector('.zoom') && state.items[state.current].lv) {
+      const at = pointIn(event);
+      zoom.rest = at;
+      liveHold = setTimeout(() => {
+        if (zoom.touches.size !== 1 || zoom.s !== 1 || zoom.slide !== slide) return;
+        liveHeld = true;
+        zoom.moved = true;               // lifting the finger is then not a tap
+        playLive(slide);
+      }, 320);
+    }
     if (zoom.touches.size === 2) startPinch();
     else if (zoom.touches.size === 1 && zoom.s > 1) {
       const p = pointIn(event);
@@ -771,6 +850,7 @@
     if (!zoom.touches.has(event.pointerId)) return;
     const p = pointIn(event);
     zoom.touches.set(event.pointerId, p);
+    if (zoom.rest && Math.hypot(p.x - zoom.rest.x, p.y - zoom.rest.y) > 8) clearTimeout(liveHold);
     if (zoom.pinch && zoom.touches.size >= 2) {
       const [a, b] = [...zoom.touches.values()];
       const start = zoom.pinch;
@@ -792,6 +872,8 @@
     if (!zoom.touches.has(event.pointerId)) return;
     const p = zoom.touches.get(event.pointerId);
     zoom.touches.delete(event.pointerId);
+    clearTimeout(liveHold);
+    if (liveHeld) { liveHeld = false; stopLive(zoom.slide); }
     if (zoom.pinch && zoom.touches.size < 2) {
       zoom.pinch = null;
       if (zoom.s < 1.05) return resetZoom(true);      // pinched back out: let go
@@ -842,8 +924,8 @@
   }, { passive: true });
 
   deck.addEventListener('click', (event) => {
-    const slide = event.target.closest('.slide');
-    const video = slide && slide.querySelector('video');
+    const video = mainVideo(event.target.closest('.slide'));
+    const slide = video && video.closest('.slide');
     if (!video) return;
     if (video.paused) playCurrent(video, slide);
     else video.pause();
@@ -856,6 +938,9 @@
       video.muted = !state.wantSound;
       if (video.paused) video.play().catch(() => {});
     }
+    const slide = slides.get(state.current);
+    const clip = slide && slide.querySelector('video.live');
+    if (clip) clip.muted = !state.wantSound;
     updateSoundIcon();
   });
 
@@ -1101,7 +1186,7 @@
         showing = slide.dataset.size === 'l' ? 'Large copy' : 'Screen copy';
       }
       body.appendChild(rows([
-        ['Type', (d.kind === 'video' ? 'Video' : 'Photo') + (kind ? ' · ' + kind : '')],
+        ['Type', (d.kind === 'video' ? 'Video' : d.live ? 'Live Photo' : 'Photo') + (kind ? ' · ' + kind : '')],
         ['Size', `${d.width} × ${d.height}${megapixels}`],
         ['Length', d.kind === 'video' ? fmtClock(d.duration) : null],
         ['Showing', showing],
@@ -1119,7 +1204,8 @@
       } else {
         const s = d.sizes || {};
         body.appendChild(rows([['Thumbnail', s.t && fmtBytes(s.t)], ['Screen', s.m && fmtBytes(s.m)],
-                               ['Large', s.l && fmtBytes(s.l)]]));
+                               ['Large', s.l && fmtBytes(s.l)],
+                               ['Live clip', s.live && `${fmtBytes(s.live)} · hold the photo, or tap LIVE, to play it`]]));
         if (slide && slide.dataset.size !== 'l') {
           const best = el('button', 'plain', 'Show the large copy');
           best.addEventListener('click', () => {
@@ -1269,6 +1355,8 @@
     body.appendChild(rescan);
 
     body.appendChild(el('h3', '', 'Adding photos and videos'));
+    body.appendChild(uploadPanel());
+    body.appendChild(el('p', 'muted small', 'Or, for files already on the machine Waterfall runs on:'));
     body.appendChild(steps);
 
     body.appendChild(el('h3', '', 'Passwords'));
@@ -1299,7 +1387,9 @@
       ['Waiting', c.waiting ? `${c.photos_waiting} photos, ${c.videos_waiting} videos (${fmtBytes(c.video_bytes_waiting)})` : null],
       ['Speed', w.video_speed ? `${w.video_speed}× (one minute of video takes ${fmtSpan(60 / w.video_speed)})` : null],
       ['Time left', s.eta_seconds ? 'about ' + fmtSpan(s.eta_seconds) : null],
-      ['Live Photos', c.paired ? `${plural(c.paired, 'motion clip')} kept out of the feed` : null],
+      ['Live Photos', (c.live || c.paired) ? [c.live ? `${c.live.toLocaleString()} with their clip` : null,
+        c.paired ? `${plural(c.paired, 'clip')} ${s.keeps_originals ? 'kept beside the photo' : 'waiting for the photo'}` : null]
+        .filter(Boolean).join(' · ') : null],
       ['Failed', c.failed || null],
       ['Space', s.storage ? `${fmtBytes(s.storage.copies)} of small copies`
         + (s.storage.awaiting ? ` · ${fmtBytes(s.storage.awaiting)} full-size still to convert` : '')
@@ -1314,6 +1404,7 @@
       retry.addEventListener('click', () => api('/api/admin/retry', {}));
       target.appendChild(retry);
     }
+    up.piece = s.upload_piece || up.piece;
     if (steps && !steps.childElementCount) {
       const line = (html) => { const li = el('li'); li.innerHTML = html; steps.appendChild(li); };
       line('Files come in over <b>WebDAV</b>, from the machine Waterfall runs on. On a Synology NAS: open <b>File Station</b>, then <b>Tools → Remote Connection → Connection Setup</b>.');
@@ -1324,6 +1415,227 @@
         line('<b>Copy, never move.</b> Waterfall keeps small copies only: once a file is converted its full-size copy here is removed, and a small text file with its name is left in its place.');
       }
     }
+  }
+
+  // -------------------------------------------------------------- upload --
+  // Files chosen on this device are sent a few megabytes at a time and put
+  // together on the server, so one dropped connection costs one piece and not
+  // the file. A few files travel at once; the rest wait their turn, which is
+  // what lets several hundred be chosen in one go. It carries on if the sheet
+  // is closed, and stops if the page is.
+  const PHOTO_NAME = /\.(heic|heif|jpe?g|png|webp|gif|tiff?|avif)$/i;
+  const VIDEO_NAME = /\.(mov|mp4|m4v|mkv|avi|webm|3gp|mts)$/i;
+  const UP_AT_ONCE = 3;
+  const up = { piece: 4 * 1024 * 1024, jobs: [], next: 0, active: 0, done: 0, skipped: 0, failed: [],
+               bytes: 0, sent: 0, running: false, stopped: false, startedAt: 0, note: '',
+               view: null, drawTimer: 0, wake: null };
+
+  function upReset() {
+    Object.assign(up, { jobs: [], next: 0, active: 0, done: 0, skipped: 0, failed: [],
+                        bytes: 0, sent: 0, running: false, stopped: false, startedAt: 0, note: '' });
+  }
+
+  function upAdd(files, realm, section) {
+    if (!up.running) upReset();
+    let left = 0;
+    const fresh = [];
+    for (const file of files) {
+      const name = file.webkitRelativePath || file.name;
+      if (name.split('/').some((part) => part.startsWith('.'))) continue;      // system clutter
+      if (!PHOTO_NAME.test(file.name) && !VIDEO_NAME.test(file.name)) { left += 1; continue; }
+      fresh.push({ file, realm, path: (section ? section + '/' : '') + name, sent: 0,
+                   id: [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('') });
+    }
+    // Photos before videos: the wall fills sooner, and the still of a Live
+    // Photo is there before its clip arrives looking for it.
+    fresh.sort((a, b) => (VIDEO_NAME.test(a.file.name) - VIDEO_NAME.test(b.file.name)) || a.path.localeCompare(b.path));
+    up.jobs.push(...fresh);
+    up.bytes += fresh.reduce((sum, job) => sum + job.file.size, 0);
+    up.note = left ? `${plural(left, 'file')} left out: not a photo or video.` : '';
+    if (fresh.length && !up.running) {
+      up.running = true;
+      up.stopped = false;
+      up.startedAt = performance.now();
+      if (navigator.wakeLock) navigator.wakeLock.request('screen').then((lock) => { up.wake = lock; }).catch(() => {});
+    }
+    upPump();
+    upDraw();
+  }
+
+  function upPump() {
+    while (up.running && !up.stopped && up.active < UP_AT_ONCE && up.next < up.jobs.length) {
+      const job = up.jobs[up.next++];
+      up.active += 1;
+      upSend(job).then((result) => {
+        if (result.skipped) up.skipped += 1;
+        up.done += 1;
+      }).catch((error) => {
+        up.sent -= job.sent;
+        up.bytes -= job.file.size;
+        up.failed.push({ job, why: error.message });
+      }).finally(() => {
+        up.active -= 1;
+        if (!up.active && (up.stopped || up.next >= up.jobs.length)) {
+          up.running = false;
+          if (up.wake) { up.wake.release().catch(() => {}); up.wake = null; }
+          if (up.done > up.skipped) api('/api/admin/rescan', {}).catch(() => {});
+        }
+        upPump();
+        upDraw();
+      });
+    }
+  }
+
+  async function upSend(job) {
+    const total = job.file.size;
+    if (!total) throw new Error('The file is empty.');
+    let offset = 0;
+    for (;;) {
+      if (up.stopped) throw new Error('Stopped.');
+      const result = await upPiece(job, offset, total);
+      const now = result.done ? total : result.have;
+      up.sent += now - job.sent;
+      job.sent = now;
+      offset = now;
+      upDraw();
+      if (result.done) return result;
+    }
+  }
+
+  // One piece, tried again a few times if the link drops it. An answer that
+  // says no (wrong kind of file, no room, signed out) is not tried again.
+  async function upPiece(job, offset, total) {
+    let wait = 1000;
+    for (let attempt = 1; ; attempt++) {
+      let response = null;
+      try {
+        response = await fetch('/api/admin/upload?realm=' + job.realm, {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'X-Waterfall': '1', 'Content-Type': 'application/octet-stream',
+                     'X-Upload-Path': encodeURIComponent(job.path), 'X-Upload-Id': job.id,
+                     'X-Upload-Offset': String(offset), 'X-Upload-Total': String(total),
+                     'X-Upload-Modified': String(Math.round((job.file.lastModified || 0) / 1000)) },
+          body: job.file.slice(offset, offset + up.piece),
+        });
+      } catch { /* the link dropped it: try again below */ }
+      if (response && response.ok) return response.json();
+      if (response && response.status < 500 && response.status !== 408 && response.status !== 429) {
+        const data = await response.json().catch(() => ({}));
+        if (response.status === 401 || response.status === 403) { up.stopped = true; throw new Error('Signed out. Unlock admin and send it again.'); }
+        throw new Error(data.error || `Refused (${response.status}).`);
+      }
+      if (attempt >= 5) throw new Error('The connection kept dropping.');
+      await new Promise((resolve) => setTimeout(resolve, wait));
+      wait *= 2.5;
+      if (up.stopped) throw new Error('Stopped.');
+    }
+  }
+
+  function upDraw() {
+    if (up.drawTimer) return;
+    up.drawTimer = setTimeout(() => {
+      up.drawTimer = 0;
+      const view = up.view;
+      if (!view || !view.isConnected) return;
+      view.textContent = '';
+      const count = up.jobs.length;
+      if (!count && !up.note) return;
+      if (count) {
+        const finished = up.done + up.failed.length;
+        let line = `${finished.toLocaleString()} of ${plural(count, 'file')} · ${fmtBytes(up.sent)} of ${fmtBytes(Math.max(up.bytes, up.sent))}`;
+        const seconds = (performance.now() - up.startedAt) / 1000;
+        if (up.running && seconds > 8 && up.sent > 0 && up.bytes > up.sent) {
+          line += ` · about ${fmtSpan((up.bytes - up.sent) / (up.sent / seconds))} left`;
+        }
+        view.appendChild(el('p', '', up.running ? 'Uploading. Keep this page open.' : up.stopped ? 'Stopped.'
+          : up.failed.length ? 'Finished, but not everything went.' : 'All of it is in. It appears on the wall as it is converted.'));
+        const meter = el('div', 'meter');
+        meter.appendChild(el('i')).style.width = (up.bytes ? Math.min(100, up.sent / up.bytes * 100) : 100) + '%';
+        view.append(meter, el('p', 'muted small', line));
+        if (up.skipped) view.appendChild(el('p', 'muted small', `${plural(up.skipped, 'file')} already here, so not sent again.`));
+      }
+      if (up.note) view.appendChild(el('p', 'muted small', up.note));
+      for (const f of up.failed.slice(0, 12)) view.appendChild(el('p', 'fail', `${f.job.file.name}: ${f.why}`));
+      if (up.failed.length > 12) view.appendChild(el('p', 'fail', `and ${up.failed.length - 12} more`));
+      if (up.running) {
+        const stop = el('button', 'plain danger', 'Stop');
+        stop.addEventListener('click', () => { up.stopped = true; upDraw(); });
+        view.appendChild(stop);
+      } else if (up.failed.length) {
+        const again = el('button', 'plain', 'Send the failed ones again');
+        again.addEventListener('click', () => {
+          const files = up.failed.map((f) => f.job);
+          upReset();
+          up.jobs = files.map((job) => Object.assign(job, { sent: 0 }));
+          up.bytes = up.jobs.reduce((sum, job) => sum + job.file.size, 0);
+          up.running = true;
+          up.startedAt = performance.now();
+          upPump();
+          upDraw();
+        });
+        view.appendChild(again);
+      }
+    }, 150);
+  }
+  window.addEventListener('beforeunload', (event) => { if (up.running) event.preventDefault(); });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && up.running && navigator.wakeLock && !up.wake) {
+      navigator.wakeLock.request('screen').then((lock) => { up.wake = lock; }).catch(() => {});
+    }
+  });
+
+  function uploadPanel() {
+    const box = el('div', 'upload');
+    let realm = state.realm;
+    const section = el('input');
+    section.type = 'text';
+    section.placeholder = 'Section (blank for Unsorted)';
+    section.autocapitalize = 'words';
+    section.setAttribute('list', 'upload-sections');
+    const known = el('datalist');
+    known.id = 'upload-sections';
+    const offer = async () => {
+      known.textContent = '';
+      try {
+        const data = realm === state.realm ? { sections: state.sections } : await api('/api/sections?realm=' + realm);
+        for (const sec of data.sections) if (sec.path) known.appendChild(el('option')).value = sec.path;
+      } catch { /* typing a name still works */ }
+    };
+    offer();
+    box.appendChild(option('Send to', segmented([['visible', 'Visible'], ['hidden', 'Hidden']], realm,
+      (picked) => { realm = picked; offer(); })));
+    box.append(section, known);
+
+    const picker = (label, whole) => {
+      const input = el('input');
+      input.type = 'file';
+      input.multiple = true;
+      input.hidden = true;
+      if (whole) input.webkitdirectory = true;
+      // Naming HEIC outright asks an iPhone for the photo as it was taken
+      // instead of a JPEG made from it.
+      else input.accept = 'image/*,video/*,.heic,.heif,.mov,.mp4,.m4v';
+      const button = el('button', 'plain', label);
+      button.type = 'button';
+      button.addEventListener('click', () => input.click());
+      input.addEventListener('change', () => {
+        const where = section.value.split('/').map((part) => part.trim()).filter(Boolean).join('/');
+        upAdd([...input.files], realm, where);
+        input.value = '';
+      });
+      box.append(input, button);
+    };
+    picker('Choose photos and videos', false);
+    // A whole folder keeps its sub-folders as sub-sections. Phones cannot choose one.
+    if ('webkitdirectory' in HTMLInputElement.prototype && window.matchMedia('(pointer: fine)').matches) {
+      picker('Choose a whole folder', true);
+    }
+    box.appendChild(el('p', 'muted small', 'Uploading copies: what you choose stays on this device. '
+      + 'From an iPhone\'s photo library a Live Photo arrives as a still, and the iPhone may shrink videos; '
+      + 'a computer sends files exactly as they are.'));
+    up.view = box.appendChild(el('div', 'upload-progress'));
+    upDraw();
+    return box;
   }
 
   function passwordForm() {

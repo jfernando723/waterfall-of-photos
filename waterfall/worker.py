@@ -113,6 +113,7 @@ class Worker:
                 if time.time() - self._last_gc > 86400:
                     self._last_gc = time.time()
                     library.collect_garbage()
+                    library.sweep_partials()
 
         todo = library.pending()
         if not todo:

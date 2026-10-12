@@ -7,8 +7,9 @@
 # WHAT THIS CAN REACH ON YOUR MACHINE: no folder of yours, and the video chip.
 #
 # There is no line here pointing at a shared folder, and that absence is the
-# whole safety design. Your photos and videos are COPIED into Waterfall through
-# its import door (any WebDAV client; on a Synology, File Station -> Tools ->
+# whole safety design. Your photos and videos are COPIED into Waterfall, either
+# from its own admin page (a phone or a laptop uploads them) or through its
+# import door (any WebDAV client; on a Synology, File Station -> Tools ->
 # Remote Connection). They then live in `waterfall-data`, a Docker NAMED volume
 # that Docker keeps in its own storage. It is not one of your shares, and your
 # file manager cannot see inside it.
@@ -18,7 +19,7 @@
 
 services:
   waterfall:
-    image: ghcr.io/jfernando723/waterfall-of-photos:0.5.1
+    image: ghcr.io/jfernando723/waterfall-of-photos:0.6.0
     container_name: waterfall
     restart: unless-stopped
 
@@ -61,6 +62,13 @@ services:
       # WATERFALL_ADMIN_PASSWORD: "choose-a-long-one"
       # Optional. Keep the full-size files as well as the small copies.
       # WATERFALL_KEEP_ORIGINALS: "1"
+      # The import door always writes a line to this container's log for a
+      # request it refuses. With this it writes one for EVERY request: what
+      # was asked and what was answered, never a file or folder name. It is
+      # ON here because the one machine this is built for has refused every
+      # file its file manager tried to copy in, and this is how the reason
+      # will be found. Delete the line once copying in works.
+      WATERFALL_DAV_LOG: "1"
 
     # ---- containment ----------------------------------------------------
     # The image already runs as a non-root user, so there is no `user:` line
@@ -82,11 +90,11 @@ services:
     mem_limit: 4g
     pids_limit: 512
 
-    logging:
-      driver: json-file
-      options:
-        max-size: "2m"
-        max-file: "3"
+    # There is no `logging:` section, on purpose. Synology's Container Manager
+    # shows a container's log (Container -> waterfall -> Log) only when the
+    # container uses the log format Synology sets by default; with any other
+    # named here that screen says "No logs available". Waterfall writes little:
+    # a few lines when it starts, and one for each thing the import door refuses.
 
 volumes:
   waterfall-data:

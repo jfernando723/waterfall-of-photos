@@ -12,9 +12,10 @@ Design constraints that shaped this file:
     costs nothing the second time.
   * Originals are never served. There is no route here that reads from the
     library of originals at all; this server only opens the small copies.
-  * Nothing here adds, changes or removes a photo or video. Files arrive, and
-    are managed, through the import door on its own port (dav.py), which only
-    the admin password opens.
+  * Files arrive two ways, and both need the admin password: through the
+    import door on its own port (dav.py), for the machine this runs on, and
+    from the admin page itself, in pieces (uploads.py), for a phone or laptop.
+    Nothing else here adds, changes or removes a photo or video.
   * No JavaScript build step and no CDN: the page asks nobody else for anything.
 """
 
@@ -28,17 +29,19 @@ import shutil
 import signal
 import threading
 import time
+import urllib.parse
 
 from flask import Flask, abort, jsonify, make_response, render_template, request, send_file
 
-from . import PIPELINE, __version__, auth, config, dav, library, media, places
+from . import PIPELINE, __version__, auth, config, dav, library, media, places, uploads
 from .worker import worker
 
 app = Flask(__name__)
 app.json.sort_keys = False
 app.config["TEMPLATES_AUTO_RELOAD"] = True      # one page; a stat per request is nothing
-# Nothing this server is sent is larger than a password or a tag. Photos and
-# videos arrive through the import door, never here.
+# Nothing this server is sent is larger than a password or a tag, with one
+# exception: a piece of a file the admin is uploading from the page, and the
+# route that takes those raises its own ceiling once it knows who is asking.
 MAX_BODY = 64 * 1024
 app.config["MAX_CONTENT_LENGTH"] = MAX_BODY
 
@@ -52,6 +55,7 @@ YEAR = 31536000
 _KEY = re.compile(r"^[0-9a-f]{24}$")
 _PHOTO = re.compile(r"^[tml]\.webp$")
 _PREVIEW = "p.mp4"
+_LIVE = "live.mp4"                   # the moving half of a Live Photo
 _RUNG = re.compile(r"^v/(\d{3,4})\.(m3u8|m4s)$")
 
 
@@ -128,6 +132,15 @@ def _asset_version() -> str:
 def index():
     response = make_response(render_template("index.html", v=_asset_version()))
     response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.get("/favicon.ico")
+def favicon():
+    """There is no icon. Saying so plainly keeps the one thing a browser asks
+    for unprompted out of its list of errors."""
+    response = make_response("", 204)
+    response.headers["Cache-Control"] = f"public, max-age={YEAR}"
     return response
 
 
@@ -282,7 +295,7 @@ def media_file(pipeline: int, key: str, name: str):
 
     if _PHOTO.match(name):
         mimetype = "image/webp"
-    elif name == _PREVIEW:
+    elif name in (_PREVIEW, _LIVE):
         mimetype = "video/mp4"
     elif _RUNG.match(name):
         mimetype = "application/vnd.apple.mpegurl" if name.endswith(".m3u8") else "video/mp4"
@@ -317,6 +330,7 @@ def admin_status():
     return jsonify(counts=c, worker=w, eta_seconds=eta, failures=library.failures(),
                    storage=storage, import_port=config.DAV_PORT,
                    hardware=media.hardware_report(), keeps_originals=config.KEEP_ORIGINALS,
+                   upload_piece=uploads.PIECE,
                    tools={"ffmpeg": bool(config.FFMPEG), "exiftool": bool(config.EXIFTOOL),
                           "heic": media.HEIC_OK})
 
@@ -334,6 +348,30 @@ def admin_retry():
     n = library.retry_failed()
     worker.rescan_now()
     return jsonify(ok=True, retried=n)
+
+
+@app.post("/api/admin/upload")
+@need("admin")
+def admin_upload():
+    """One piece of one file, sent by the admin page from a phone or a laptop.
+    The pieces are put together, and the rules enforced, in uploads.py."""
+    request.max_content_length = uploads.PIECE
+    head = request.headers
+    try:
+        result = uploads.receive(
+            request.args.get("realm", ""), urllib.parse.unquote(head.get("X-Upload-Path", "")),
+            head.get("X-Upload-Id", ""), int(head.get("X-Upload-Offset", "-1")),
+            int(head.get("X-Upload-Total", "0")), request.get_data(cache=False),
+            float(head.get("X-Upload-Modified") or 0) or None)
+    except uploads.Refused as no:
+        return jsonify(error=no.message), no.status
+    except ValueError:
+        return jsonify(error="Bad request."), 400
+    except OSError as exc:
+        return jsonify(error=exc.strerror or "The file could not be kept."), 507 if exc.errno == 28 else 500
+    if result["done"] and not result.get("skipped"):
+        worker.rescan_soon()
+    return jsonify(result)
 
 
 @app.post("/api/admin/tag")
@@ -436,8 +474,12 @@ def serve_options() -> dict:
                # that keeps thumbnails flowing while a video segment is sent.
                "threads": 12,
                # Refused from the request's own headers, before any of an
-               # oversized body has been read or kept.
-               "max_request_body_size": MAX_BODY}
+               # oversized body has been read or kept. The ceiling is one piece
+               # of an upload: the server reads a whole request before it can
+               # ask who sent it, so this much can be sent by anyone, and the
+               # number of connections is what bounds the total.
+               "max_request_body_size": uploads.PIECE + MAX_BODY,
+               "connection_limit": 48}
     if config.TRUSTED_PROXY:
         # Behind a reverse proxy every visitor arrives from the proxy's address
         # and over plain http. Believing the proxy's word on who it is passing
@@ -450,8 +492,23 @@ def serve_options() -> dict:
     return options
 
 
+def _allow_open_files(wanted: int = 4096) -> None:
+    """The import door may hold several hundred connections waiting their
+    turn, and each is an open file. Raise this process's own limit as far as
+    it is allowed to, so that a bulk copy cannot run it out."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+        if soft != resource.RLIM_INFINITY and soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def main() -> None:
     from waitress import serve
+    _allow_open_files()
     config.ensure_roots()
     library.connect()
     requeued = library.requeue_after_recipe_change()

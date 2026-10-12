@@ -297,6 +297,34 @@ def collect_garbage(grace: float = GRACE) -> int:
     return removed
 
 
+PARTIAL_AGE = 86400
+
+
+def sweep_partials(older_than: float = PARTIAL_AGE) -> int:
+    """Remove what an upload left behind when it was abandoned half-way.
+
+    A file on its way in has a hidden name until it has arrived completely.
+    One that stops arriving, because a phone was put away or a browser closed,
+    would otherwise stay for ever, unseen and taking room. A day without
+    growing is long enough to call it abandoned."""
+    cutoff = time.time() - older_than
+    removed = 0
+    for realm in config.REALMS.values():
+        for folder, dirs, files in os.walk(os.path.join(config.MEDIA_DIR, realm)):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS]
+            for name in files:
+                if not (name.startswith(".") and ".part-" in name):
+                    continue
+                path = os.path.join(folder, name)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                        removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
 # ---------------------------------------------------------------- stand-ins --
 
 def read_stub(path: str) -> dict | None:
@@ -329,6 +357,8 @@ def copies_complete(key: str, done: dict) -> bool:
     if done.get("kind") == "photo":
         if set(expect) != {"t.webp", "m.webp", "l.webp"}:
             return False
+        if done.get("live"):
+            expect["live.mp4"] = (done.get("sizes") or {}).get("live")
     else:
         if not {"t.webp", "m.webp"} <= set(expect) or not done.get("rungs") or not done.get("duration"):
             return False
@@ -475,19 +505,79 @@ def pending(limit: int = 200) -> list[sqlite3.Row]:
         "ORDER BY (kind='video'), size LIMIT ?", (MAX_ATTEMPTS, limit)).fetchall()
 
 
-def _is_live_photo_motion(con, row, meta: dict) -> bool:
-    """An iPhone Live Photo is a HEIC plus a ~3 second MOV with the same name.
-    The MOV is not a video anyone chose to take; converting and listing it would
-    double every Live Photo in the feed."""
+def _stem_match(stem: str) -> tuple[str, list]:
+    """SQL for "a file with this name and any ending". The caller also names
+    the section, which is what keeps the match inside one folder."""
+    return ("lower(substr(rel_path, 1, ?)) = lower(?) AND length(rel_path) > ?",
+            [len(stem) + 1, stem + ".", len(stem) + 1])
+
+
+def _live_twin(con, row, meta: dict):
+    """A Live Photo is a still plus a clip of two or three seconds with the
+    same name. The clip is not a video anyone chose to take: listed by itself
+    it would double every Live Photo in the feed. Returns the still's row if
+    this video is such a clip."""
     duration = meta.get("Duration")
-    if not isinstance(duration, (int, float)) or duration > 4.0:
-        return False
+    if not isinstance(duration, (int, float)) or duration > media.LIVE_LONGEST:
+        return None
     stem = os.path.splitext(row["rel_path"])[0]
-    twin = con.execute(
-        "SELECT 1 FROM items WHERE kind='photo' AND section_id=? AND id<>? "
-        "AND lower(substr(rel_path, 1, ?)) = lower(?) AND length(rel_path) > ?",
-        (row["section_id"], row["id"], len(stem) + 1, stem + ".", len(stem))).fetchone()
-    return twin is not None
+    where, params = _stem_match(stem)
+    return con.execute(
+        "SELECT id, key, status FROM items WHERE kind='photo' AND section_id=? AND id<>? "
+        f"AND {where} ORDER BY length(rel_path) LIMIT 1",
+        [row["section_id"], row["id"]] + params).fetchone()
+
+
+def _index_fields(done: dict) -> tuple[str, int]:
+    """What the index keeps of a finished item: its details, and how much room
+    its copies take."""
+    info = {k: done[k] for k in ("meta", "sizes", "rungs", "hdr", "has_audio", "made_by", "live") if k in done}
+    copy_bytes = sum(v for v in (done.get("sizes") or {}).values() if isinstance(v, int)) \
+        + sum(r["bytes"] for r in done.get("rungs") or [])
+    return json.dumps(info), copy_bytes
+
+
+def _keep_motion(con, row, key: str, twin, full: str, meta: dict) -> str:
+    """File a Live Photo's clip with its still: one small moving copy beside
+    the still's own copies, played when the photo is pressed. The clip is not
+    an item, so once that copy exists the clip itself is not kept."""
+    with con:
+        con.execute("UPDATE items SET status='paired', key=?, error=NULL WHERE id=?", (key, row["id"]))
+    done = _load_done(twin["key"], "photo") if twin["status"] == "ready" and twin["key"] else None
+    if done is None:
+        return "paired"         # the still is not converted yet: it sends for this clip when it is
+    made = media.make_live(full, os.path.join(media.deriv_dir(twin["key"]), "live.mp4"),
+                           fps=meta.get("VideoFrameRate"))
+    done.setdefault("sizes", {})["live"] = made["bytes"]
+    done["live"] = {"w": made["w"], "h": made["h"], "has_audio": made["has_audio"],
+                    "duration": round(float(meta.get("Duration") or 0), 3)}
+    tmp = _done_path(twin["key"]) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(done, f)
+    os.replace(tmp, _done_path(twin["key"]))
+    info, copy_bytes = _index_fields(done)
+    with con:
+        con.execute("UPDATE items SET info=?, copy_bytes=? WHERE key=? AND kind='photo' AND status='ready'",
+                    (info, copy_bytes, twin["key"]))
+    if not config.KEEP_ORIGINALS:
+        try:
+            os.remove(full)
+            with con:
+                con.execute("DELETE FROM items WHERE id=?", (row["id"],))
+        except OSError:
+            pass
+    return "paired"
+
+
+def _send_for_motion(con, row) -> None:
+    """A still has just been converted. If its clip arrived first and has been
+    waiting, put the clip back in the queue so that it can now be filed."""
+    stem = os.path.splitext(row["rel_path"])[0]
+    where, params = _stem_match(stem)
+    with con:
+        con.execute("UPDATE items SET status='new', attempts=0, error=NULL "
+                    f"WHERE kind='video' AND status='paired' AND section_id=? AND {where}",
+                    [row["section_id"]] + params)
 
 
 def convert(row, meta: dict | None = None, progress=None) -> str:
@@ -511,18 +601,9 @@ def convert(row, meta: dict | None = None, progress=None) -> str:
         if done is None:
             if meta is None:
                 meta = media.probe_many([full]).get(full, {})
-            if row["kind"] == "video" and _is_live_photo_motion(con, row, meta):
-                with con:
-                    con.execute("UPDATE items SET status='paired', key=? WHERE id=?",
-                                (key, row["id"]))
-                if not config.KEEP_ORIGINALS:
-                    try:        # the still half is the item; the motion half is not kept
-                        os.remove(full)
-                        with con:
-                            con.execute("DELETE FROM items WHERE id=?", (row["id"],))
-                    except OSError:
-                        pass
-                return "paired"
+            twin = _live_twin(con, row, meta) if row["kind"] == "video" else None
+            if twin is not None:
+                return _keep_motion(con, row, key, twin, full, meta)
             outdir = media.deriv_dir(key)
             if row["kind"] == "photo":
                 result = media.make_photo(full, outdir)
@@ -536,18 +617,18 @@ def convert(row, meta: dict | None = None, progress=None) -> str:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(done, f)
             os.replace(tmp, _done_path(key))
-        info = {k: done[k] for k in ("meta", "sizes", "rungs", "hdr", "has_audio", "made_by") if k in done}
-        copy_bytes = sum(v for v in (done.get("sizes") or {}).values() if isinstance(v, int)) \
-            + sum(r["bytes"] for r in done.get("rungs") or [])
+        info, copy_bytes = _index_fields(done)
         with con:
             con.execute(
                 "UPDATE items SET status='ready', key=?, error=NULL, taken_local=?, taken_ts=?, "
                 "taken_src=?, width=?, height=?, duration=?, placeholder=?, info=?, copy_bytes=?, "
                 "trashed=? WHERE id=?",
                 (key, done["taken_local"], done["taken_ts"], done["taken_src"], done["width"],
-                 done["height"], done.get("duration"), done["placeholder"], json.dumps(info),
+                 done["height"], done.get("duration"), done["placeholder"], info,
                  copy_bytes, 1 if gone else 0, row["id"]))
         _restore_tags(con, key)
+        if row["kind"] == "photo":
+            _send_for_motion(con, row)
         if not gone:
             trash_original(row, key, done)
         return "ready"
@@ -702,6 +783,8 @@ def feed(realm: str, section_id: int | None, order: str, seed: int, offset: int,
             entry["r"] = [g["name"] for g in info.get("rungs", [])]
             if info.get("sizes", {}).get("p"):
                 entry["p"] = 1          # has a moving preview for the wall
+        elif r["info"] and '"live"' in r["info"]:
+            entry["lv"] = 1             # a Live Photo: pressing it plays its clip
         out.append(entry)
     return out
 
@@ -847,6 +930,7 @@ def counts() -> dict:
     row = con.execute(
         "SELECT SUM(status='ready') AS ready, SUM(status='new') AS waiting, "
         "SUM(status='error') AS failed, SUM(status='paired') AS paired, "
+        "SUM(status='ready' AND kind='photo' AND info LIKE '%\"live\":%') AS live, "
         "SUM(CASE WHEN status='new' AND kind='video' THEN size ELSE 0 END) AS video_bytes_waiting, "
         "SUM(status='new' AND kind='photo') AS photos_waiting, "
         "SUM(status='new' AND kind='video') AS videos_waiting, "

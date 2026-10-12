@@ -73,6 +73,11 @@ BIND = os.environ.get("WATERFALL_BIND", "0.0.0.0")
 # Station on the NAS can reach it and nothing else on the network can.
 DAV_PORT = int(os.environ.get("WATERFALL_DAV_PORT", "7276"))
 DAV_BIND = os.environ.get("WATERFALL_DAV_BIND", BIND)
+# The door always writes a line to the log for a request it refuses. Set this
+# to 1 and it writes one for every request: what was asked and what was
+# answered, never a file or folder name. For finding out why a file manager
+# will not copy something in.
+DAV_LOG = os.environ.get("WATERFALL_DAV_LOG", "0") == "1"
 
 # Only when Waterfall sits behind a reverse proxy (to add https, say): the
 # address that proxy connects FROM, as this container sees it, or "*" if the

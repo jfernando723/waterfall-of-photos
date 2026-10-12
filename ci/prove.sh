@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Start a Waterfall image the way docker-compose.yml starts it, and prove it
-# works: hardened, importing through the door, hiding what is hidden, and
-# keeping its library when the container is replaced.
+# works: hardened, importing through the door and from the page, hiding what
+# is hidden, keeping a Live Photo's clip, saying in its log what it refused,
+# and keeping its library when the container is replaced.
 #
 #     bash ci/prove.sh <image>
 #
@@ -118,9 +119,49 @@ test "$(curl -fsS "$base/healthz" | field ready)" = "None"
 say "with the admin password: the hidden wall"
 test "$(curl -fsS -b "$work/jar" "$base/api/feed?realm=hidden" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["items"]))')" = "1"
 
+say "uploading from the page: one photo, in two pieces, and only for the admin"
+picture "900,1200" "30,140,90" "$work/three.jpg"
+size="$(wc -c < "$work/three.jpg" | tr -d ' ')"; half=$((size / 2))
+head -c "$half" "$work/three.jpg" > "$work/three.a"
+tail -c +"$((half + 1))" "$work/three.jpg" > "$work/three.b"
+piece() {
+  curl -fsS -b "$work/jar" -H 'X-Waterfall: 1' -H 'Content-Type: application/octet-stream' \
+    -H 'X-Upload-Path: Phone%2Fthree.jpg' -H 'X-Upload-Id: 00112233445566ff' \
+    -H "X-Upload-Total: $size" -H "X-Upload-Offset: $1" --data-binary "@$2" "$base/api/admin/upload?realm=visible"
+}
+test "$(piece 0 "$work/three.a" | field done)" = "False"
+test "$(piece "$half" "$work/three.b" | field name)" = "three.jpg"
+test "$(code -X POST -H 'X-Waterfall: 1' -H 'X-Upload-Path: x.jpg' -H 'X-Upload-Id: 00112233445566ff' \
+  -H 'X-Upload-Total: 3' -H 'X-Upload-Offset: 0' --data-binary abc "$base/api/admin/upload?realm=visible")" = "403"
+
+say "a Live Photo: a still and its clip, copied in together, are one item that moves"
+picture "1200,1600" "150,40,120" "$work/live.jpg"
+docker run --rm --entrypoint sh "$image" -c 'ffmpeg -nostdin -loglevel error -f lavfi \
+  -i testsrc2=size=640x480:rate=30 -t 2 -c:v libx264 -pix_fmt yuv420p /tmp/clip.mov && cat /tmp/clip.mov' > "$work/live.mov"
+curl -fsS -u "x:$password" -T "$work/live.jpg" "$door/Visible/Trip/IMG_1.jpg"
+curl -fsS -u "x:$password" -T "$work/live.mov" "$door/Visible/Trip/IMG_1.MOV"
+curl -fsS -b "$work/jar" -H 'X-Waterfall: 1' -X POST "$base/api/admin/rescan" >/dev/null
+tally() {
+  curl -fsS -b "$work/jar" "$base/api/admin/status" | python3 -c '
+import json, sys
+c = json.load(sys.stdin)["counts"]
+print(c["ready"], c["live"], c["waiting"], c["paired"], c["failed"])'
+}
+for _ in $(seq 1 60); do [[ "$(tally)" == "4 1 0 0 0" ]] && break; sleep 2; done
+test "$(tally)" = "4 1 0 0 0"
+key="$(curl -fsS "$base/api/feed?limit=100" | python3 -c 'import json,sys; print([i["key"] for i in json.load(sys.stdin)["items"] if i.get("lv")][0])')"
+pipeline="$(curl -fsS "$base/api/me" | field pipeline)"
+test "$(curl -s -o /dev/null -w '%{http_code} %{content_type}' "$base/m/$pipeline/$key/live.mp4")" = "200 video/mp4"
+
+say "the log says what the door refused, and names no file or folder"
+test "$(code -u "x:not-the-password" -X PROPFIND "$door/")" = "401"
+docker logs "$name" > "$work/log.txt" 2>&1
+grep -q "import door: PROPFIND answered 401, wrong password" "$work/log.txt"
+! grep -qE "one\.jpg|two\.jpg|three\.jpg|IMG_1|Trip|Secret|Phone" "$work/log.txt"
+
 say "it survives being replaced: the library is in the volume, not the container"
 docker rm -f "$name" >/dev/null
 start
-test "$(curl -fsS -b "$work/jar" "$base/healthz" | field ready)" = "2"
+test "$(curl -fsS -b "$work/jar" "$base/healthz" | field ready)" = "4"
 
 say "all of it held"

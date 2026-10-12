@@ -20,14 +20,17 @@ a private VPN. Read this before putting it anywhere else.
 | **One password, no accounts.** | Six wrong guesses from one address lock that address out for five minutes. Behind Docker on some NAS systems every visitor appears to come from the same address, so six wrong guesses by anyone lock sign-in for everyone for those five minutes. Someone on your network can use that to keep you from signing in, though not to get in. Choose a long password: the minimum is six characters and that is too short for anything but a home network. |
 | **Signing out forgets the cookie, not the pictures.** | A browser keeps what it has already downloaded. On a shared phone or computer, hidden pictures you looked at stay in that browser's cache until it is cleared. |
 | **The import door is for the machine itself.** | The compose file publishes port 7276 on `127.0.0.1` only. If you open it to your network, the admin password crosses that network unencrypted with every file copied. |
+| **The admin can upload from the page.** | Files sent that way arrive on port 7275 in pieces of 4 MB, and only the admin's are kept. But the server has to read a request before it can tell who sent it, so anyone who can reach the port can make it read 4 MB at a time, on up to 48 connections at once: about 200 MB held briefly in memory, at worst. Before uploads existed that ceiling was 64 KB a request. |
 | **It converts whatever you copy in.** | Photos and videos are opened by Pillow, ffmpeg and ExifTool. A file made to attack one of those could, at worst, act as Waterfall inside its container: read, damage or send away the library, and reach whatever the container can reach on your network. It could not touch any other file on the machine, because the container is given no folder, no capabilities and a read-only system. Only import files you would open on your own computer, and rebuild or update the image now and then so Debian's fixes arrive. |
 | **Hidden means "needs the admin password", not "encrypted".** | Hidden items sit in the same Docker volume as everything else. Anyone with administrator access to the machine can read them. |
 
 What has been done about the rest is in the tests (`tests/test_waterfall.py`): nothing
 under Hidden is reachable without the admin password by any address; requests that
 change anything must come from Waterfall's own page; the import door cannot be climbed
-out of, lied to about sizes, or held open by idle connections; and a file cannot send
-the converter to the network.
+out of or lied to about sizes, serves a fixed number of connections at once and makes
+the rest wait or turns them away; an upload from the page needs the admin, stays inside
+the two walls and never overwrites anything; and a file cannot send the converter to the
+network.
 
 ## Reporting a problem
 

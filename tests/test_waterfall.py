@@ -28,6 +28,7 @@ import hashlib
 import http.client
 import json
 import os
+import resource
 import shutil
 import socket
 import stat
@@ -41,7 +42,7 @@ import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from waterfall import PIPELINE, auth, config, dav, library, media, places  # noqa: E402
+from waterfall import PIPELINE, auth, config, dav, library, media, places, uploads  # noqa: E402
 from tests import fixtures  # noqa: E402
 
 ROOT = tempfile.mkdtemp(prefix="waterfall-test-")
@@ -259,6 +260,29 @@ class TestPipeline(unittest.TestCase):
         names = [library.item(i, True)["name"] for i in ids("visible")]
         self.assertIn("IMG_0010.HEIC", names)
         self.assertNotIn("IMG_0010.MOV", names)
+
+    def test_a_live_photo_keeps_its_clip_as_one_small_moving_copy(self):
+        still = item_named("IMG_0010.HEIC")
+        self.assertEqual(still["kind"], "photo")
+        self.assertEqual((still["live"]["w"], still["live"]["h"]), (640, 480))
+        self.assertTrue(still["live"]["has_audio"])
+        self.assertAlmostEqual(still["live"]["duration"], 2.0, delta=0.3)
+        clip = os.path.join(media.deriv_dir(still["key"]), "live.mp4")
+        self.assertEqual(os.path.getsize(clip), still["sizes"]["live"])
+        made = media.video_frame_info(clip)
+        self.assertEqual((made["width"], made["height"], made["has_audio"]), (640, 480, True))
+        # The feed marks it, and marks nothing else.
+        marked = {i["id"] for i in library.feed("visible", None, "new", 1, 0, 100) if i.get("lv")}
+        self.assertEqual(marked, {still["id"]})
+        self.assertNotIn("live", item_named("IMG_0004.HEIC"))
+        self.assertEqual(library.counts()["live"], 1)
+        # A clip is never enlarged, and one bigger than the top size is brought down to it.
+        big = fixtures.video(os.path.join(ROOT, "scratch-live", "big.mov"), 1440, 1920, 1, fps=60, hdr=True)
+        out = media.make_live(big, os.path.join(ROOT, "scratch-live", "live.mp4"), fps=60)
+        self.assertEqual((out["w"], out["h"]), (1080, 1440))
+        self.assertNotIn(media.video_frame_info(os.path.join(ROOT, "scratch-live", "live.mp4"))["trc"],
+                         media.HDR_TRANSFERS, "an HDR clip comes out in ordinary colour, like every other copy")
+        self.assertFalse(os.path.exists(os.path.join(ROOT, "scratch-live", "live.mp4.part")))
 
     def test_index_can_be_rebuilt_without_converting_again(self):
         # Throw the database away; the small copies describe themselves.
@@ -780,10 +804,65 @@ class TestAuth(unittest.TestCase):
             self.assertTrue(auth.check_admin(ADMIN, "new-address"), "expired guesses must be swept, not counted")
             self.assertEqual(len(auth._FAILS), 0)
             auth._FAILS.update({f"live-{i}": [time.time()] for i in range(50)})
-            self.assertFalse(auth.check_admin(ADMIN, "one-more-address"), "full of live guessers: wait")
+            self.assertFalse(auth.check_admin("a-guess", "one-more-address"), "full of live guessers: wait")
+            self.assertEqual(len(auth._FAILS), 50)
+            # The owner is not shut out by them: a password already proven needs
+            # no place in the list. One not yet proven waits like any other.
+            self.assertTrue(auth.check_admin(ADMIN, "one-more-address"))
+            auth._PROVEN.clear()
+            self.assertFalse(auth.check_admin(ADMIN, "one-more-address"), "not proven yet, and no room: wait")
             self.assertEqual(len(auth._FAILS), 50)
         finally:
             auth.FAILS_KEPT = saved
+
+    def test_the_owner_copying_many_files_at_once_is_not_taken_for_a_guesser(self):
+        # A file manager copying a folder sends many requests together, each
+        # with the right password. Each used to be counted as a guess while it
+        # was being checked, so the seventh was refused and the copy failed
+        # with a permission error.
+        auth.set_passwords(ADMIN, None)
+        together, results = threading.Barrier(16), []
+
+        def ask():
+            try:
+                together.wait()
+                results.append(auth.check_admin(ADMIN, "10.0.0.50"))
+            finally:
+                library.close()
+
+        threads = [threading.Thread(target=ask) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results, [True] * 16)
+        self.assertNotIn("10.0.0.50", auth._FAILS)
+
+    def test_a_remembered_password_buys_no_guesses_and_does_not_outlive_a_change(self):
+        auth.set_passwords(ADMIN, None)
+        self.assertTrue(auth.check_admin(ADMIN, "10.0.0.60"))
+        checked, real = [], auth._matches
+
+        def counting(password, stored):
+            checked.append(1)
+            return real(password, stored)
+
+        auth._matches = counting
+        try:
+            self.assertTrue(auth.check_admin(ADMIN, "10.0.0.60"))
+            self.assertEqual(checked, [], "proved once, it is not checked the slow way again")
+            # Wrong guesses are counted as before, and lock the address as before.
+            for _ in range(auth.FAIL_LIMIT):
+                self.assertFalse(auth.check_admin("wrong", "10.0.0.61"))
+            self.assertEqual(len(checked), auth.FAIL_LIMIT)
+            self.assertFalse(auth.check_admin(ADMIN, "10.0.0.61"), "even the right password must wait")
+            self.assertFalse(auth.check_admin("wrong", "10.0.0.61"))
+            self.assertEqual(len(checked), auth.FAIL_LIMIT, "and nothing is checked while it waits")
+        finally:
+            auth._matches = real
+        auth.set_passwords("another-admin", None)
+        self.assertFalse(auth.check_admin(ADMIN, "10.0.0.62"), "the old password goes with the change")
+        self.assertTrue(auth.check_admin("another-admin", "10.0.0.62"))
 
 
 class TestHTTP(unittest.TestCase):
@@ -887,7 +966,10 @@ class TestHTTP(unittest.TestCase):
         from waterfall.app import MAX_BODY, serve_options
         plain = serve_options()
         self.assertNotIn("trusted_proxy", plain)
-        self.assertEqual(plain["max_request_body_size"], MAX_BODY)
+        # One piece of an upload is the most anyone can make the server read,
+        # and the number of connections bounds how many of those at once.
+        self.assertEqual(plain["max_request_body_size"], uploads.PIECE + MAX_BODY)
+        self.assertLessEqual(plain["connection_limit"] * plain["max_request_body_size"], 256 * 1024 * 1024)
         config.TRUSTED_PROXY = "172.17.0.1"
         try:
             behind = serve_options()
@@ -896,7 +978,7 @@ class TestHTTP(unittest.TestCase):
         self.assertEqual(behind["trusted_proxy"], "172.17.0.1")
         self.assertTrue(behind["clear_untrusted_proxy_headers"])
         for options in (plain, behind):                 # the web server accepts them as written
-            self.assertEqual(Adjustments(**{**options, "port": 0}).max_request_body_size, MAX_BODY)
+            self.assertEqual(Adjustments(**{**options, "port": 0}).max_request_body_size, uploads.PIECE + MAX_BODY)
 
     def test_wrong_password_and_setup_cannot_be_repeated(self):
         c = self.client()
@@ -1019,6 +1101,11 @@ class TestSmallCopiesOnly(unittest.TestCase):
         self.assertIn("removed the full-size file", text)
         stub = library.read_stub(os.path.join(self.folder, "IMG_8002.mp4.waterfall.txt"))
         self.assertEqual((stub["kind"], stub["name"]), ("video", "IMG_8002.mp4"))
+        # The Live Photo's clip is gone as a file but kept as the still's moving copy.
+        still = item_named("IMG_8003.HEIC")
+        self.assertTrue(os.path.exists(os.path.join(media.deriv_dir(still["key"]), "live.mp4")))
+        self.assertGreater(still["sizes"]["live"], 0)
+        self.assertIsNone(library.connect().execute("SELECT 1 FROM items WHERE name='IMG_8003.MOV'").fetchone())
 
     def test_2_the_items_are_still_there_and_still_play(self):
         from waterfall.app import app
@@ -1074,6 +1161,10 @@ class TestSmallCopiesOnly(unittest.TestCase):
         # The broken file is tried again (and fails again); nothing that had
         # been converted is converted a second time, and nothing could be.
         self.assertEqual(set(calls), {"IMG_8004.jpg"})
+        # A Live Photo is still one after the index is rebuilt: its clip is
+        # recorded beside the copies, not only in the index.
+        self.assertGreater(item_named("IMG_8003.HEIC")["sizes"]["live"], 0)
+        self.assertEqual(library.counts()["live"], 1)
 
     def test_5_moving_or_deleting_the_stand_in_moves_or_deletes_the_item(self):
         hidden = os.path.join(config.MEDIA_DIR, "Hidden", "Away")
@@ -1115,6 +1206,245 @@ class TestSmallCopiesOnly(unittest.TestCase):
         self.assertIn("Import it again", failed.get("Visible/Trip/IMG_8003.HEIC", ""))
 
 
+class TestLivePhotos(unittest.TestCase):
+    """A Live Photo is a still and a clip with the same name. The still is the
+    item; the clip becomes its moving copy, whichever of the two arrives first."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="waterfall-live-")
+        point_at(os.path.join(self.dir, "data"), os.path.join(self.dir, "data", "media"))
+        config.KEEP_ORIGINALS = False
+        self.folder = os.path.join(config.MEDIA_DIR, "Hidden", "Days")
+
+    def tearDown(self):
+        config.KEEP_ORIGINALS = True
+        point_at(DATA)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_clip_that_arrives_before_its_still_waits_for_it(self):
+        clip = fixtures.video(os.path.join(self.folder, "IMG_7001.MOV"), 640, 480, 2)
+        # Something holds the still up (here: it is not a picture yet).
+        still = os.path.join(self.folder, "IMG_7001.JPG")
+        with open(still, "wb") as f:
+            f.write(b"not arrived properly")
+        convert_everything()
+        row = library.connect().execute("SELECT status FROM items WHERE name='IMG_7001.MOV'").fetchone()
+        self.assertEqual(row["status"], "paired")
+        self.assertTrue(os.path.exists(clip), "a clip whose still is not ready is kept, not thrown away")
+        self.assertEqual(ids("hidden"), [], "and it is not shown as a video in the meantime")
+        # The still arrives properly. The clip is sent for and filed with it.
+        os.remove(still)
+        fixtures.photo(still, 1600, 1200, "late")
+        library.retry_failed()
+        convert_everything()
+        found = item_named("IMG_7001.JPG")
+        self.assertGreater(found["sizes"]["live"], 0)
+        self.assertFalse(os.path.exists(clip))
+        self.assertEqual(sorted(os.listdir(self.folder)), ["IMG_7001.JPG.waterfall.txt"])
+        self.assertEqual(library.counts()["paired"], 0)
+
+    def test_a_longer_video_with_a_photos_name_is_a_video(self):
+        fixtures.photo(os.path.join(self.folder, "IMG_7002.jpg"), 1600, 1200, "still")
+        fixtures.video(os.path.join(self.folder, "IMG_7002.mp4"), 640, 360, 5)
+        convert_everything()
+        kinds = {library.item(i, True)["name"]: library.item(i, True)["kind"] for i in ids("hidden")}
+        self.assertEqual(kinds, {"IMG_7002.jpg": "photo", "IMG_7002.mp4": "video"})
+        self.assertNotIn("live", item_named("IMG_7002.jpg"))
+
+    def test_the_clip_is_served_like_any_other_copy_and_hidden_with_its_photo(self):
+        from waterfall.app import app
+        fixtures.photo(os.path.join(self.folder, "IMG_7003.HEIC"), 1512, 2016, "hidden live")
+        fixtures.video(os.path.join(self.folder, "IMG_7003.MOV"), 640, 480, 2)
+        convert_everything()
+        auth.set_passwords(ADMIN, None)
+        key = item_named("IMG_7003.HEIC")["key"]
+        url = f"/m/{PIPELINE}/{key}/live.mp4"
+        self.assertEqual(app.test_client().get(url).status_code, 404, "a hidden photo's clip is hidden too")
+        admin = app.test_client()
+        admin.post("/api/login", json={"password": ADMIN}, headers={"X-Waterfall": "1"})
+        whole = admin.get(url)
+        self.assertEqual((whole.status_code, whole.mimetype), (200, "video/mp4"))
+        self.assertIn("immutable", whole.headers["Cache-Control"])
+        self.assertEqual(admin.get(url, headers={"Range": "bytes=0-9"}).status_code, 206)
+        feed = admin.get("/api/feed?realm=hidden&order=new").get_json()["items"]
+        self.assertEqual([i.get("lv") for i in feed], [1])
+        self.assertTrue(library.copies_complete(key, library._load_done(key, "photo")))
+        os.remove(os.path.join(media.deriv_dir(key), "live.mp4"))
+        self.assertFalse(library.copies_complete(key, library._load_done(key, "photo")),
+                         "a Live Photo whose clip has gone missing is not complete")
+
+
+class TestUploads(unittest.TestCase):
+    """Sending files from the admin page: in pieces, admin only, and never
+    over anything that is already there."""
+
+    @classmethod
+    def setUpClass(cls):
+        from waterfall.app import app
+        cls.app = app
+        cls.dir = tempfile.mkdtemp(prefix="waterfall-upload-")
+        point_at(os.path.join(cls.dir, "data"), os.path.join(cls.dir, "data", "media"))
+        auth.set_passwords(ADMIN, None)
+        cls.photo = fixtures.photo(os.path.join(cls.dir, "one.jpg"), 1200, 900, "upload")
+        with open(cls.photo, "rb") as f:
+            cls.bytes = f.read()
+
+    @classmethod
+    def tearDownClass(cls):
+        point_at(DATA)
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def setUp(self):
+        auth._FAILS.clear()
+
+    def admin(self):
+        c = self.app.test_client()
+        r = c.post("/api/login", json={"password": ADMIN}, headers={"X-Waterfall": "1"})
+        self.assertEqual(r.status_code, 200)
+        return c
+
+    def send(self, c, path, data, offset=0, total=None, realm="visible", upload_id="0123456789abcdef", **extra):
+        headers = {"X-Waterfall": "1", "X-Upload-Path": path, "X-Upload-Id": upload_id,
+                   "X-Upload-Offset": str(offset), "X-Upload-Total": str(len(data) if total is None else total)}
+        headers.update(extra)
+        return c.post(f"/api/admin/upload?realm={realm}", data=data, headers=headers)
+
+    def where(self, *parts):
+        return os.path.join(config.MEDIA_DIR, *parts)
+
+    def test_only_the_admin_and_only_from_our_own_page(self):
+        anyone = self.app.test_client()
+        self.assertEqual(self.send(anyone, "x.jpg", self.bytes).status_code, 403)
+        c = self.admin()
+        r = c.post("/api/admin/upload?realm=visible", data=self.bytes,
+                   headers={"X-Upload-Path": "x.jpg", "X-Upload-Id": "0123456789abcdef",
+                            "X-Upload-Offset": "0", "X-Upload-Total": str(len(self.bytes))})
+        self.assertEqual(r.status_code, 400, "without our own header it is another site's form")
+        self.assertFalse(os.path.exists(self.where("Visible", "x.jpg")))
+
+    def test_a_file_in_pieces_is_whole_at_the_end_and_unseen_until_then(self):
+        c = self.admin()
+        data, cut = self.bytes, len(self.bytes) // 2
+        first = self.send(c, "Trips%2FNorway%2FIMG_1.jpg", data[:cut], 0, len(data), X_Upload_Modified="1700000000")
+        self.assertEqual(first.get_json(), {"have": cut, "done": False})
+        folder = self.where("Visible", "Trips", "Norway")
+        self.assertEqual([n for n in os.listdir(folder) if not n.startswith(".")], [],
+                         "half a file has a hidden name: the scanner and the door do not see it")
+        self.assertEqual(library.scan()["added"], 0)
+        # The same piece sent twice (a retry) is not written twice.
+        again = self.send(c, "Trips%2FNorway%2FIMG_1.jpg", data[cut:cut + 10], 0 + 5, len(data)).get_json()
+        self.assertEqual((again["have"], again["done"], again["resume"]), (cut, False, True))
+        last = self.send(c, "Trips%2FNorway%2FIMG_1.jpg", data[cut:], cut, len(data)).get_json()
+        self.assertEqual((last["done"], last["skipped"], last["name"]), (True, False, "IMG_1.jpg"))
+        with open(os.path.join(folder, "IMG_1.jpg"), "rb") as f:
+            self.assertEqual(f.read(), data)
+        self.assertEqual(os.listdir(folder), ["IMG_1.jpg"])
+        self.assertEqual(library.scan()["added"], 1)
+
+    def test_the_date_the_device_gave_is_kept(self):
+        c = self.admin()
+        r = self.send(c, "Dated%2Fd.jpg", self.bytes, **{"X-Upload-Modified": "1700000000"})
+        self.assertTrue(r.get_json()["done"])
+        self.assertEqual(int(os.path.getmtime(self.where("Visible", "Dated", "d.jpg"))), 1700000000)
+
+    def test_nothing_is_overwritten_and_nothing_is_sent_twice(self):
+        c = self.admin()
+        self.assertTrue(self.send(c, "Same%2Fa.jpg", self.bytes).get_json()["done"])
+        # The same file again: recognised from its first piece, nothing stored.
+        twice = self.send(c, "Same%2Fa.jpg", self.bytes[:100], 0, len(self.bytes), upload_id="1" * 16).get_json()
+        self.assertEqual((twice["done"], twice["skipped"]), (True, True))
+        # A different file with that name: kept, under a new one.
+        other = self.bytes + b"different"
+        kept = self.send(c, "Same%2Fa.jpg", other, upload_id="2" * 16).get_json()
+        self.assertEqual((kept["skipped"], kept["name"]), (False, "a (2).jpg"))
+        with open(self.where("Visible", "Same", "a.jpg"), "rb") as f:
+            self.assertEqual(f.read(), self.bytes)
+        # Once converted, the full-size file is a stand-in: still recognised.
+        config.KEEP_ORIGINALS = False
+        try:
+            convert_everything()
+        finally:
+            config.KEEP_ORIGINALS = True
+        self.assertTrue(os.path.exists(self.where("Visible", "Same", "a.jpg.waterfall.txt")))
+        late = self.send(c, "Same%2Fa.jpg", self.bytes[:100], 0, len(self.bytes), upload_id="3" * 16).get_json()
+        self.assertEqual((late["done"], late["skipped"]), (True, True))
+
+    def test_only_photos_and_videos_and_only_inside_the_two_walls(self):
+        c = self.admin()
+        for path, status in (("notes.txt", 415), ("..%2Fescape.jpg", 400), ("a%2F..%2F..%2Fb.jpg", 400),
+                             (".hidden.jpg", 400), ("%40eaDir%2Fx.jpg", 400), ("", 400),
+                             ("%2F".join(["d"] * 13) + "%2Fdeep.jpg", 400)):
+            self.assertEqual(self.send(c, path, self.bytes).status_code, status, path)
+        self.assertEqual(self.send(c, "x.jpg", self.bytes, realm="elsewhere").status_code, 400)
+        self.assertEqual(self.send(c, "x.jpg", self.bytes, upload_id="../../x").status_code, 400)
+        self.assertEqual(self.send(c, "x.jpg", self.bytes, total=10).status_code, 400)
+        self.assertEqual(self.send(c, "x.jpg", self.bytes, offset=7, total=len(self.bytes) + 7,
+                                   upload_id="4" * 16).status_code, 409,
+                         "a later piece of an upload nobody began")
+        self.assertTrue(self.send(c, "Secret%2Fh.jpg", self.bytes, realm="hidden").get_json()["done"])
+        self.assertTrue(os.path.exists(self.where("Hidden", "Secret", "h.jpg")))
+        self.assertEqual([n for n in os.listdir(self.where("Visible")) if n in ("x.jpg", "escape.jpg")], [])
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(config.MEDIA_DIR), "b.jpg")))
+
+    def test_one_request_carries_one_piece_and_no_more(self):
+        c = self.admin()
+        big = b"0" * (uploads.PIECE + 1)
+        self.assertEqual(self.send(c, "big.mov", big).status_code, 413)
+        # A whole piece, far larger than any other route accepts, is taken.
+        whole = self.send(c, "big.mov", big[:-1], 0, uploads.PIECE * 2, upload_id="7" * 16)
+        self.assertEqual(whole.get_json(), {"have": uploads.PIECE, "done": False})
+        os.remove(self.where("Visible", ".big.mov.part-" + "7" * 16))
+        self.assertFalse(os.path.exists(self.where("Visible", "big.mov")))
+        # Every other route still takes nothing larger than a password.
+        from waterfall.app import MAX_BODY
+        r = c.post("/api/admin/tag", data=b"x" * (MAX_BODY + 1),
+                   headers={"X-Waterfall": "1", "Content-Type": "application/json"})
+        self.assertEqual(r.status_code, 413)
+
+    def test_five_hundred_files_chosen_in_one_go_all_arrive(self):
+        # As the page sends them: a few at a time, each in two pieces.
+        jobs = list(range(500))
+        lock, problems = threading.Lock(), []
+
+        def sender():
+            c = self.admin()
+            while True:
+                with lock:
+                    if not jobs:
+                        return
+                    n = jobs.pop()
+                data = b"picture number %d " % n * 8
+                cut = len(data) // 2
+                for offset, piece in ((0, data[:cut]), (cut, data[cut:])):
+                    r = self.send(c, f"Bulk%2FIMG_{n:04d}.jpg", piece, offset, len(data), upload_id=f"{n:016x}")
+                    if r.status_code != 200:
+                        with lock:
+                            problems.append((n, r.status_code))
+
+        threads = [threading.Thread(target=sender) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(problems, [])
+        names = sorted(os.listdir(self.where("Visible", "Bulk")))
+        self.assertEqual(len(names), 500)
+        self.assertEqual((names[0], names[-1]), ("IMG_0000.jpg", "IMG_0499.jpg"))
+        with open(self.where("Visible", "Bulk", "IMG_0499.jpg"), "rb") as f:
+            self.assertEqual(f.read(), b"picture number 499 " * 8)
+        shutil.rmtree(self.where("Visible", "Bulk"))
+
+    def test_what_an_abandoned_upload_leaves_is_cleared_after_a_day(self):
+        c = self.admin()
+        self.send(c, "Left%2Fgone.mov", b"half of it", 0, 1000, upload_id="5" * 16)
+        self.send(c, "Left%2Fgoing.mov", b"half of it", 0, 1000, upload_id="6" * 16)
+        folder = self.where("Visible", "Left")
+        old = os.path.join(folder, ".gone.mov.part-" + "5" * 16)
+        os.utime(old, (time.time() - 2 * 86400,) * 2)
+        self.assertEqual(library.sweep_partials(), 1)
+        self.assertEqual(os.listdir(folder), [".going.mov.part-" + "6" * 16], "one still arriving is left alone")
+
+
 class TestImportDoor(unittest.TestCase):
     """The only way files get in: WebDAV on its own port, admin password only."""
 
@@ -1144,8 +1474,8 @@ class TestImportDoor(unittest.TestCase):
     def setUp(self):
         auth._FAILS.clear()
 
-    def ask(self, method, path, body=None, password=ADMIN, headers=None, user="anything"):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+    def ask(self, method, path, body=None, password=ADMIN, headers=None, user="anything", timeout=20):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         h = dict(headers or {})
         if password is not None:
             h["Authorization"] = "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
@@ -1188,14 +1518,27 @@ class TestImportDoor(unittest.TestCase):
             self.assertEqual(status, expect, method)
         self.assertLess(time.time() - started, 10)
 
-    def test_only_so_many_connections_are_served_at_once(self):
-        saved, dav.MAX_CLIENTS = dav.MAX_CLIENTS, 2
+    def _small_door(self, clients: int, waiting: int):
+        saved = dav.MAX_CLIENTS, dav.MAX_WAITING
+        dav.MAX_CLIENTS, dav.MAX_WAITING = clients, waiting
         try:
             server = dav._Server(("127.0.0.1", 0), dav.Handler)
         finally:
-            dav.MAX_CLIENTS = saved
+            dav.MAX_CLIENTS, dav.MAX_WAITING = saved
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        port, idle = server.server_address[1], []
+        return server, server.server_address[1]
+
+    def _until(self, what, seconds=10):
+        """Wait for the door to get there, however busy the machine is. A fixed
+        pause is a guess about speed, and a loaded build machine proves it wrong."""
+        deadline = time.time() + seconds
+        while not what():
+            self.assertLess(time.time(), deadline, "the door never reached the expected state")
+            time.sleep(0.01)
+
+    def test_only_so_many_connections_are_served_at_once(self):
+        server, port = self._small_door(2, 0)
+        idle = []
 
         def answer():
             with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
@@ -1206,19 +1549,170 @@ class TestImportDoor(unittest.TestCase):
                     return b""
         try:
             self.assertTrue(answer().startswith(b"HTTP/1.1 200"))
+            self._until(lambda: server._serving == 0)   # that one has really finished, not only answered
             for _ in range(2):                      # two that connect and then say nothing
                 idle.append(socket.create_connection(("127.0.0.1", port), timeout=5))
-            time.sleep(0.3)
-            self.assertEqual(answer(), b"", "a third must be turned away, not queued behind them")
+            self._until(lambda: server._serving == 2)
+            self.assertEqual(answer(), b"", "with no room to wait, a third is turned away at once")
             for s in idle:
                 s.close()
-            time.sleep(0.3)
+            self._until(lambda: server._serving == 0)
             self.assertTrue(answer().startswith(b"HTTP/1.1 200"), "and served again once they have gone")
         finally:
             for s in idle:
                 s.close()
             server.shutdown()
             server.server_close()
+
+    def test_a_connection_beyond_those_waits_its_turn_and_is_served(self):
+        server, port = self._small_door(1, 1)
+        try:
+            first = socket.create_connection(("127.0.0.1", port), timeout=5)    # served, and saying nothing
+            self._until(lambda: server._serving == 1)
+            second = socket.create_connection(("127.0.0.1", port), timeout=5)   # waits
+            second.sendall(b"OPTIONS / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            self._until(lambda: len(server._waiting) == 1)
+            third = socket.create_connection(("127.0.0.1", port), timeout=5)    # no room even to wait
+            third.settimeout(10)
+            try:
+                self.assertEqual(third.recv(64), b"", "past the waiting room, a connection is turned away")
+            except ConnectionError:
+                pass
+            second.settimeout(0.3)
+            with self.assertRaises(TimeoutError, msg="the one waiting is not answered before its turn"):
+                second.recv(64)
+            first.close()                           # its place passes to the one waiting
+            second.settimeout(10)
+            self.assertTrue(second.recv(64).startswith(b"HTTP/1.1 200"))
+            for s in (second, third):
+                s.close()
+            self._until(lambda: server._serving == 0)       # and every place is given back
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_five_hundred_at_once_are_all_served(self):
+        # A bulk copy started in one go. None is refused; they take turns.
+        self.assertEqual(dav.MAX_CLIENTS + dav.MAX_WAITING, 500)
+        # This test is both ends of five hundred connections, so it needs twice
+        # the open files the door itself does.
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 4096 if hard == resource.RLIM_INFINITY else min(4096, hard)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        if resource.getrlimit(resource.RLIMIT_NOFILE)[0] not in (resource.RLIM_INFINITY,) \
+                and resource.getrlimit(resource.RLIMIT_NOFILE)[0] < 2048:
+            self.skipTest("this machine allows too few open files to be both ends of 500 connections")
+        auth._PROVEN.clear()
+        results, lock = [], threading.Lock()
+
+        def one(n):
+            try:
+                status = self.ask("PUT", f"/Visible/bulk/{n:03d}.jpg", body=b"photo %d" % n, timeout=120)[0]
+            except OSError as exc:
+                status = type(exc).__name__
+            with lock:
+                results.append(status)
+
+        self.assertEqual(self.ask("MKCOL", "/Visible/bulk")[0], 201)
+        threads = [threading.Thread(target=one, args=(n,)) for n in range(500)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(set(results), key=str), [201], results)
+        folder = os.path.join(config.MEDIA_DIR, "Visible", "bulk")
+        self.assertEqual(len(os.listdir(folder)), 500)
+        with open(os.path.join(folder, "499.jpg"), "rb") as f:
+            self.assertEqual(f.read(), b"photo 499")
+        shutil.rmtree(folder)
+
+    def test_it_says_what_the_admin_may_do_and_uses_proper_lock_names(self):
+        status, xml, _ = self.ask("PROPFIND", "/Visible/", headers={"Depth": "0"})
+        may = {e.tag.split("}")[1] for e in ET.fromstring(xml).iter() if e.tag.startswith("{DAV:}")
+               and e.tag.split("}")[1] in ("write", "write-content", "bind", "unbind")}
+        self.assertEqual(may, {"write", "write-content", "bind", "unbind"})
+        status, xml, headers = self.ask("LOCK", "/Visible/locked.jpg", body=b"<lockinfo/>")
+        self.assertEqual(status, 201)
+        token = headers["Lock-Token"].strip("<>")
+        self.assertRegex(token, r"^opaquelocktoken:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+        status, _, headers = self.ask("PUT", "/Visible/locked.jpg", body=self.bytes)
+        self.assertEqual(status, 204)
+        self.assertRegex(headers["ETag"], r'^"[0-9a-f]+-[0-9a-f]+"$')
+        self.assertEqual(self.ask("DELETE", "/Visible/locked.jpg")[0], 204)
+
+    def test_many_requests_at_once_with_the_right_password_are_all_served(self):
+        # What a file manager does when it copies a folder. Six used to get in
+        # and the rest were told 401, which it reports as a permission error.
+        auth._PROVEN.clear()                       # as after a restart: nothing remembered yet
+        together, statuses = threading.Barrier(16), []
+
+        def one():
+            together.wait()
+            statuses.append(self.ask("PROPFIND", "/Visible/", headers={"Depth": "0"})[0])
+
+        threads = [threading.Thread(target=one) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(statuses, [207] * 16)
+
+    def test_a_refusal_is_written_to_the_log_and_no_name_ever_is(self):
+        lines, real = [], dav._say
+        dav._say = lines.append
+        try:
+            self.assertEqual(self.ask("PROPFIND", "/Visible/", headers={"Depth": "0"})[0], 207)
+            self.assertEqual(self.ask("PROPFIND", "/Visible/secret-name.jpg")[0], 404)
+            self.assertEqual(self.ask("PROPFIND", "/", password=None)[0], 401)
+            self.assertEqual(lines, [], "ordinary answers are not written down")
+            self.assertEqual(self.ask("PUT", "/Visible/no-such-folder/secret-name.jpg", body=b"x")[0], 409)
+            self.assertEqual(self.ask("PUT", "/Visible/secret-name.jpg", body=b"x", password="wrong")[0], 401)
+            self.assertEqual(len(lines), 2, lines)
+            self.assertIn("PUT answered 409", lines[0])
+            self.assertIn("PUT answered 401, wrong password", lines[1])
+            config.DAV_LOG = True                  # every request, for finding a fault
+            self.assertEqual(self.ask("PUT", "/Visible/secret-name.jpg", body=self.bytes)[0], 201)
+            self.assertIn(f"PUT answered 201, {len(self.bytes)} bytes kept", lines[2])
+            self.assertEqual(self.ask("DELETE", "/Visible/secret-name.jpg")[0], 204)
+            self.assertEqual(len(lines), 4)
+            # What a client asks about is written down by name; what it says is not.
+            asking = (b'<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:quota-available-bytes/>'
+                      b"<D:owner>secret-name</D:owner></D:prop></D:propfind>")
+            self.assertEqual(self.ask("PROPFIND", "/Visible/", body=asking, headers={"Depth": "0"})[0], 207)
+            self.assertIn("asks for: quota-available-bytes owner", lines[4])
+        finally:
+            dav._say, config.DAV_LOG = real, False
+        said = "\n".join(lines)
+        self.assertNotIn("secret-name", said)
+        self.assertNotIn("no-such-folder", said)
+        self.assertNotIn(ADMIN, said)
+
+    def test_a_client_that_goes_away_leaves_one_line_and_no_half_file(self):
+        lines, real = [], dav._say
+        dav._say = lines.append
+        try:
+            word = base64.b64encode(f"x:{ADMIN}".encode()).decode()
+            with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+                s.sendall(b"PUT /Visible/gone.jpg HTTP/1.1\r\nHost: x\r\nAuthorization: Basic " + word.encode()
+                          + b"\r\nContent-Length: 1000000\r\n\r\n" + b"x" * 1000)
+            for _ in range(50):
+                if lines:
+                    break
+                time.sleep(0.1)
+        finally:
+            dav._say = real
+        self.assertEqual(lines, ["PUT ended early, the client went away (1000 of 1000000 bytes had arrived)"])
+        self.assertEqual([n for n in os.listdir(os.path.join(config.MEDIA_DIR, "Visible")) if "gone" in n], [])
+
+    def test_a_folder_says_how_much_room_there_is(self):
+        status, xml, _ = self.ask("PROPFIND", "/Visible/", headers={"Depth": "0"})
+        self.assertEqual(status, 207)
+        room = ET.fromstring(xml).find(".//{DAV:}quota-available-bytes")
+        self.assertIsNotNone(room, "a client told nothing may assume there is none")
+        self.assertGreaterEqual(int(room.text), 0)
+        self.assertLessEqual(int(room.text), shutil.disk_usage(config.MEDIA_DIR).free + 64 * 1024 * 1024)
 
     def test_the_two_roots_are_all_there_is_and_cannot_be_changed(self):
         self.assertEqual(self.names("/"), ["/Visible/", "/Hidden/"])

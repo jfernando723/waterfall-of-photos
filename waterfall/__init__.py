@@ -9,5 +9,5 @@ Two version numbers, deliberately separate:
     a phone can never show a stale copy it cached under the old one.
 """
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 PIPELINE = 3
