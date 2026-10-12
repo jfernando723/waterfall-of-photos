@@ -18,7 +18,7 @@
 
 services:
   waterfall:
-    image: ghcr.io/jfernando723/waterfall-of-photos:0.5.0
+    image: ghcr.io/jfernando723/waterfall-of-photos:0.5.1
     container_name: waterfall
     restart: unless-stopped
 
@@ -74,10 +74,12 @@ services:
       - no-new-privileges:true
 
     # ---- limits ---------------------------------------------------------
-    # Converting 4K video is heavy. It runs at low priority so the machine's
-    # real work always wins, and these stop it ever being the reason the
-    # machine runs short. On a machine with 4 GB or less, try 2g.
-    mem_limit: 3g
+    # Set for the machine this is built for: a Synology DS920+ with 8 GB of
+    # memory. Converting a 4K HDR phone video without the video chip takes
+    # about 2.6 GB for the converter alone (measured), so the ceiling is 4 GB:
+    # room to finish, and half the machine left for everything else. It runs
+    # at low priority, so the machine's real work always wins.
+    mem_limit: 4g
     pids_limit: 512
 
     logging:

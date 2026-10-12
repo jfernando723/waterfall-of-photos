@@ -24,6 +24,17 @@ Waterfall is a private scrolling wall for your own photos and videos. It was mad
 one household: the pictures live on a NAS at home, and are looked at from a phone a
 long way off, over a slow link (about 275 ms away, 1 to 2.6 MB per second).
 
+**It is built for one machine, and every setting in it is that machine's:**
+
+| | |
+|---|---|
+| Machine | Synology DS920+ |
+| Processor | Intel Celeron J4125, 4 cores, 2 GHz, with an Intel video chip |
+| Memory | 8 GB |
+| System | DSM 7.4.1, with Container Manager |
+
+No other machine has been considered.
+
 | | |
 |---|---|
 | Opening it | The address shows the **Visible** wall at once. No sign-in, no username. |
@@ -73,10 +84,12 @@ Read `SECURITY.md`. The short version:
 ## If you run it anyway
 
 There is an image, because my own NAS uses it: `ghcr.io/jfernando723/waterfall-of-photos`.
-It was built once, when this was published, and **it will not be rebuilt as the software
+Each version was built once, when it was published, and **is not rebuilt as the software
 inside it goes out of date.** If you want a current one, build it yourself (below).
 
-You need a 64-bit Intel or AMD machine with Docker and about 2 GB of free memory.
+The compose text is set for the machine above: it lets the container use up to 4 GB,
+because converting a 4K HDR phone video without the video chip takes about 2.6 GB for the
+converter alone (measured), and it passes in that machine's Intel video chip.
 
 **With the ready-made image.** Take `docker-compose.yml` from this repository and start it.
 On a Synology NAS that is Container Manager → Project → Create → "Create
@@ -93,7 +106,7 @@ is made.
 ```
 git clone https://github.com/jfernando723/waterfall-of-photos.git
 cd waterfall-of-photos
-docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.5.0 .
+docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.5.1 .
 docker compose up -d
 ```
 
@@ -104,8 +117,9 @@ docker compose up -d
 | 3 | From the machine itself, connect a WebDAV client to `127.0.0.1`, port `7276`, any username, the admin password. On a Synology NAS: File Station → Tools → Remote Connection → Connection Setup → WebDAV | You see two folders, `Visible` and `Hidden` |
 | 4 | **Copy** folders of photos and videos into one of them | The ··· menu → admin shows them counted as waiting, then converted |
 
-If the container will not start and the error mentions `/dev/dri`, your machine has no
-Intel video chip to pass in: delete the two `devices:` lines from `docker-compose.yml`.
+If the container will not start and the error mentions `/dev/dri`, the video chip could
+not be passed in: delete the two `devices:` lines from `docker-compose.yml`. It then
+converts in software and says so on its admin page.
 
 ### Settings
 
@@ -131,10 +145,10 @@ the `Dockerfile`.
 
 | | |
 |---|---|
-| A real NAS | Never tried. Not the install, not the import from a NAS's file manager, not the speed. |
+| The machine it is built for | Never tried on it. Not the install, not the import from File Station, not the speed. |
 | The Intel video chip | The code that uses it has never run on an Intel chip. At start-up it converts a test clip through each driver and uses one only if the picture matches the software result; otherwise it converts in software and says so on the admin page. That check is tested; the chip is not. |
-| Speed | Converting 4K phone video in software is slow: on a small four-core NAS, estimated at fourteen to twenty-one times the length of the video. An estimate, not a measurement. |
-| ARM machines | The image was built and passed its tests on ARM once, in a rehearsal. It has never run on an ARM machine beyond that, and nothing there can use a video chip. |
+| Speed | Converting 4K phone video in software is slow: on the DS920+, estimated at fourteen to twenty-one times the length of the video. An estimate, not a measurement. |
+| Any other machine | Not considered. The memory ceiling, the video chip, the user and group numbers and the install steps are all the DS920+'s. |
 | Place names | The list is GeoNames' places of 500 people or more, plus every named village in Sierra Leone and in Chad, plus a short hand-made list of names in Sierra Leone. Those are the places it was made for. Anywhere else, somewhere too small for the list is named for the nearest town on it within 120 km, or not at all. `scripts/make-places.py` rebuilds the list for other countries. |
 | Browsers | Made for Safari on an iPhone. Other browsers were not a goal. |
 | Upgrades | No upgrade between versions has ever been tested, because there has only been one installation and it was a test. |

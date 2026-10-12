@@ -35,7 +35,7 @@ code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 field() { python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1]))' "$1"; }
 start() {
   docker run -d --name "$name" --read-only --tmpfs /tmp --cap-drop ALL \
-    --security-opt no-new-privileges --memory 3g --pids-limit 512 \
+    --security-opt no-new-privileges --memory 4g --pids-limit 512 \
     -v "$volume":/data -e TZ=Etc/UTC \
     -p 127.0.0.1:7275:7275 -p 127.0.0.1:7276:7276 "$image" >/dev/null
   for _ in $(seq 1 60); do
