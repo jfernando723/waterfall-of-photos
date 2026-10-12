@@ -79,6 +79,11 @@ DAV_BIND = os.environ.get("WATERFALL_DAV_BIND", BIND)
 # will not copy something in.
 DAV_LOG = os.environ.get("WATERFALL_DAV_LOG", "0") == "1"
 
+# How long the admin stays signed in without touching the page. After this the
+# Hidden wall closes by itself, so that a phone put down unlocked does not go
+# on showing it to whoever picks it up next.
+ADMIN_IDLE = max(1, int(os.environ.get("WATERFALL_ADMIN_IDLE_MINUTES", "30"))) * 60
+
 # Only when Waterfall sits behind a reverse proxy (to add https, say): the
 # address that proxy connects FROM, as this container sees it, or "*" if the
 # container can be reached by nothing else. Empty means no proxy is believed.

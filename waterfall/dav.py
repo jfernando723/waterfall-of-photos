@@ -288,9 +288,30 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self.close_connection = True
 
-    def _allowed(self) -> bool:
+    def handle_expect_100(self):
+        """A client that says "Expect: 100-continue" is asking whether to send
+        its file at all, and waits for the answer. Saying "continue" before
+        looking at the password makes it send the file only to be told 401
+        part-way, and a client that cannot send a file twice gives up there: a
+        NAS's own file manager does exactly this, sends no password until it
+        is asked for one, and reports the failure as a lack of privileges. So
+        the password is looked at first. Without it the answer is 401 at once,
+        before a byte of the file has been sent, and the client asks again
+        with the password."""
+        self._why, self._asked = "", b""
+        try:
+            if self.command != "OPTIONS" and not self._allowed(body_coming=False):
+                return False
+        except (ConnectionError, TimeoutError):
+            self.close_connection = True
+            return False
+        return super().handle_expect_100()
+
+    def _allowed(self, body_coming: bool = True) -> bool:
         """Admin password or nothing. The username is ignored: clients insist
-        on asking for one, and Waterfall has none."""
+        on asking for one, and Waterfall has none. `body_coming` is False when
+        the client is still waiting to be told whether to send its body: there
+        is then nothing to read, and waiting for it would wait for ever."""
         if not auth.is_configured():
             self._why = "no admin password has been chosen yet"
             self.close_connection = True
@@ -312,7 +333,8 @@ class Handler(BaseHTTPRequestHandler):
                 return True
             self._why = (f"too many wrong passwords from this address, {wait} seconds to wait"
                          if wait else "wrong password")
-        self._drain_if_small()
+        if body_coming:
+            self._drain_if_small()
         self.close_connection = True
         self._send(401, b"The Waterfall admin password is needed.\n",
                    headers={"WWW-Authenticate": 'Basic realm="Waterfall import"', "Connection": "close"})

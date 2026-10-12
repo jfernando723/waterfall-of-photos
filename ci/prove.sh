@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Start a Waterfall image the way docker-compose.yml starts it, and prove it
 # works: hardened, importing through the door and from the page, hiding what
-# is hidden, keeping a Live Photo's clip, saying in its log what it refused,
-# and keeping its library when the container is replaced.
+# is hidden, keeping a Live Photo's clip, taking a file from a client that asks
+# before it sends, saying in its log what it refused, and keeping its library
+# when the container is replaced.
 #
 #     bash ci/prove.sh <image>
 #
@@ -152,6 +153,19 @@ test "$(tally)" = "4 1 0 0 0"
 key="$(curl -fsS "$base/api/feed?limit=100" | python3 -c 'import json,sys; print([i["key"] for i in json.load(sys.stdin)["items"] if i.get("lv")][0])')"
 pipeline="$(curl -fsS "$base/api/me" | field pipeline)"
 test "$(curl -s -o /dev/null -w '%{http_code} %{content_type}' "$base/m/$pipeline/$key/live.mp4")" = "200 video/mp4"
+
+say "a client that asks before it sends, and has no password until asked, gets its file in"
+# This is how a Synology's own file manager uploads. The file comes from a pipe,
+# so it cannot be sent twice: the door has to say no BEFORE the first attempt sends it.
+cat "$work/one.jpg" | curl -fsS --anyauth -u "x:$password" -H 'Expect: 100-continue' -T - "$door/Visible/Trip/asked-first.bin"
+curl -fsS -u "x:$password" "$door/Visible/Trip/asked-first.bin" | cmp - "$work/one.jpg"
+curl -fsS -u "x:$password" -X DELETE "$door/Visible/Trip/asked-first.bin"
+
+say "the admin's sign-in is short, and an upload ticket opens nothing but uploading"
+curl -fsS -b "$work/jar" "$base/api/me" | python3 -c 'import json,sys; m=json.load(sys.stdin); assert m["admin"] and m["admin_idle"] == 1800 and 0 < m["admin_left"] <= 1800, m'
+ticket="$(curl -fsS -b "$work/jar" -H 'X-Waterfall: 1' -X POST "$base/api/admin/upload-ticket" | field ticket)"
+test "$(code -H "X-Upload-Ticket: $ticket" "$base/api/admin/status")" = "403"
+test "$(code -H "X-Upload-Ticket: $ticket" "$base/api/feed?realm=hidden")" = "403"
 
 say "the log says what the door refused, and names no file or folder"
 test "$(code -u "x:not-the-password" -X PROPFIND "$door/")" = "401"

@@ -228,8 +228,32 @@ button.tag.add { padding: 4px 11px; color: var(--muted); border: 1px dashed var(
 .meter { height: 6px; border-radius: 3px; background: var(--bg); overflow: hidden; margin: 8px 0 4px; }
 .meter i { display: block; height: 100%; background: var(--accent); }
 .fail { font-size: 13px; color: var(--danger); overflow-wrap: anywhere; margin: 4px 0; }
-.upload-progress { margin-top: 6px; }
+.upload-progress { margin-top: 10px; }
 .upload-progress p { margin: 6px 0; }
+.up-head { display: flex; align-items: baseline; gap: 12px; }
+.up-head b { font-size: 28px; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.meter.busy i { background-image: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+                background-size: 60px 100%; background-repeat: no-repeat; animation: sweep 1.2s linear infinite; }
+@keyframes sweep { from { background-position: -60px 0; } to { background-position: 100% 0; } }
+.option select { flex: 1; min-width: 0; max-width: 62%; padding: 8px 10px; border-radius: 9px; font: inherit;
+                 color: var(--text); background: var(--bg); border: 1px solid var(--line); }
+.plain.primary-ish { background: var(--text); color: #000; }
+details.more { margin-top: 14px; color: var(--muted); font-size: 14px; }
+details.more summary { cursor: pointer; padding: 6px 0; }
+/* The upload, on the wall, for when the sheet is closed. */
+.upload-pill { position: fixed; left: 50%; transform: translateX(-50%); z-index: 15;
+               bottom: calc(14px + var(--safe-bottom)); max-width: calc(100% - 24px);
+               padding: 9px 16px; border-radius: 999px; overflow: hidden; white-space: nowrap;
+               font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums;
+               background: rgba(30, 30, 36, 0.92); border: 1px solid var(--line);
+               -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+               box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5); }
+.upload-pill i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--accent);
+                 opacity: 0.35; transition: width 0.3s; }
+.upload-pill span { position: relative; }
+.upload-pill.waiting i, .upload-pill.stopped i { background: var(--muted); }
+.upload-pill.failed { color: var(--danger); }
+.upload-pill.failed i { background: var(--danger); }
 .steps { margin: 6px 0 0; padding-left: 20px; color: var(--muted); font-size: 14px; }
 .steps li { margin: 4px 0; }
 .steps b { color: var(--text); font-weight: 600; }

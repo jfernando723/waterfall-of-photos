@@ -743,6 +743,42 @@ class TestAuth(unittest.TestCase):
         self.assertIsNone(auth.role_of("forged.token.value"))
         self.assertIsNone(auth.role_of(None))
 
+    def test_the_admin_sign_in_lapses_when_left_alone_and_a_viewers_does_not(self):
+        auth.set_passwords(ADMIN, VIEWER)
+        admin, viewer = auth.issue("admin"), auth.issue("viewer")
+        self.assertEqual(auth.role_of(admin), "admin")
+        self.assertAlmostEqual(auth.admin_seconds_left(admin), config.ADMIN_IDLE, delta=2)
+        self.assertEqual(config.ADMIN_IDLE, 30 * 60)
+        real = time.time
+        try:
+            time.time = lambda: real() + config.ADMIN_IDLE - 5
+            self.assertEqual(auth.role_of(admin), "admin")
+            time.time = lambda: real() + config.ADMIN_IDLE + 5
+            self.assertEqual(auth.role_of(admin), "viewer", "left alone too long, the admin is a viewer again")
+            self.assertEqual(auth.admin_seconds_left(admin), 0)
+            self.assertEqual(auth.role_of(viewer), "viewer")
+            time.time = lambda: real() + 30 * 86400
+            self.assertEqual(auth.role_of(viewer), "viewer", "a viewer is not asked again for sixty days")
+        finally:
+            time.time = real
+
+    def test_an_upload_ticket_adds_files_and_proves_nothing_else(self):
+        auth.set_passwords(ADMIN, None)
+        ticket = auth.issue_ticket()
+        self.assertTrue(auth.ticket_ok(ticket))
+        self.assertIsNone(auth.role_of(ticket), "a ticket is not a sign-in")
+        self.assertFalse(auth.ticket_ok(auth.issue("admin")), "and a sign-in is not a ticket")
+        self.assertFalse(auth.ticket_ok("forged.ticket.value"))
+        self.assertFalse(auth.ticket_ok(None))
+        real = time.time
+        try:
+            time.time = lambda: real() + auth.TICKET_AGE + 5
+            self.assertFalse(auth.ticket_ok(ticket), "a day is the longest an upload is given")
+        finally:
+            time.time = real
+        auth.set_passwords("another-admin", None)
+        self.assertFalse(auth.ticket_ok(ticket), "a change of password cancels it")
+
     def test_guessing_is_throttled_at_sign_in_and_at_the_import_door(self):
         auth.set_passwords(ADMIN, None)
         for _ in range(auth.FAIL_LIMIT):
@@ -922,6 +958,33 @@ class TestHTTP(unittest.TestCase):
         self.assertEqual(c.get(f"/api/item/{secret['id']}").get_json()["realm"], "hidden")
         c.post("/api/logout", headers={"X-Waterfall": "1"})
         self.assertEqual(c.get("/api/feed?realm=hidden").status_code, 403, "locking must lock")
+
+    def test_left_alone_for_half_an_hour_the_admin_is_signed_out(self):
+        c = self.client(ADMIN)
+        me = c.get("/api/me").get_json()
+        self.assertEqual((me["admin"], me["admin_idle"]), (True, 1800))
+        self.assertAlmostEqual(me["admin_left"], 1800, delta=3)
+        real = time.time
+        try:
+            # Twenty minutes on, somebody touches the page: the half hour starts again.
+            time.time = lambda: real() + 1200
+            self.assertAlmostEqual(c.get("/api/me").get_json()["admin_left"], 600, delta=3)
+            self.assertEqual(c.post("/api/admin/touch", headers={"X-Waterfall": "1"}).status_code, 200)
+            time.time = lambda: real() + 1200 + 1700
+            self.assertTrue(c.get("/api/me").get_json()["admin"], "renewed at twenty minutes, so still the admin")
+            # Asking for the library's status is not somebody touching the page.
+            self.assertEqual(c.get("/api/admin/status").status_code, 200)
+            time.time = lambda: real() + 1200 + 1900
+            me = c.get("/api/me").get_json()
+            self.assertEqual((me["admin"], me["role"], me["admin_left"]), (False, "viewer", 0))
+            self.assertEqual(c.get("/api/feed?realm=hidden").status_code, 403)
+            self.assertEqual(c.get("/api/admin/status").status_code, 403)
+            self.assertEqual(c.post("/api/admin/touch", headers={"X-Waterfall": "1"}).status_code, 403,
+                             "once lapsed it cannot be renewed, only signed in to again")
+            hidden = item_named("IMG_0005.jpg")["key"]
+            self.assertEqual(c.get(f"/m/{PIPELINE}/{hidden}/t.webp").status_code, 404)
+        finally:
+            time.time = real
 
     def test_the_health_check_says_how_much_there_is_only_to_the_admin(self):
         # Its count covers both walls, so to a stranger it would give away how
@@ -1341,6 +1404,26 @@ class TestUploads(unittest.TestCase):
         self.assertEqual(os.listdir(folder), ["IMG_1.jpg"])
         self.assertEqual(library.scan()["added"], 1)
 
+    def test_an_upload_carries_on_with_its_ticket_after_the_admin_has_gone(self):
+        c = self.admin()
+        ticket = c.post("/api/admin/upload-ticket", headers={"X-Waterfall": "1"}).get_json()["ticket"]
+        self.assertEqual(self.app.test_client().post("/api/admin/upload-ticket",
+                                                     headers={"X-Waterfall": "1"}).status_code, 403)
+        data, cut = self.bytes, len(self.bytes) // 2
+        self.assertEqual(self.send(c, "Long%2Fv.jpg", data[:cut], 0, len(data), upload_id="8" * 16).status_code, 200)
+        # The admin's sign-in lapses or is signed out of. The page still holds the ticket.
+        gone = self.app.test_client()
+        self.assertEqual(self.send(gone, "Long%2Fv.jpg", data[cut:], cut, len(data), upload_id="8" * 16).status_code, 403)
+        last = self.send(gone, "Long%2Fv.jpg", data[cut:], cut, len(data), upload_id="8" * 16,
+                         **{"X-Upload-Ticket": ticket})
+        self.assertEqual((last.status_code, last.get_json()["done"]), (200, True))
+        with open(self.where("Visible", "Long", "v.jpg"), "rb") as f:
+            self.assertEqual(f.read(), data)
+        # The ticket opens nothing else.
+        for path in ("/api/admin/status", "/api/feed?realm=hidden"):
+            self.assertEqual(gone.get(path, headers={"X-Upload-Ticket": ticket}).status_code, 403, path)
+        self.assertEqual(self.send(gone, "Long%2Fw.jpg", data, **{"X-Upload-Ticket": "forged.ticket.value"}).status_code, 403)
+
     def test_the_date_the_device_gave_is_kept(self):
         c = self.admin()
         r = self.send(c, "Dated%2Fd.jpg", self.bytes, **{"X-Upload-Modified": "1700000000"})
@@ -1641,6 +1724,42 @@ class TestImportDoor(unittest.TestCase):
         self.assertEqual(status, 204)
         self.assertRegex(headers["ETag"], r'^"[0-9a-f]+-[0-9a-f]+"$')
         self.assertEqual(self.ask("DELETE", "/Visible/locked.jpg")[0], 204)
+
+    def _raw(self, lines: list[str], wait: float = 5.0):
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=wait)
+        s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        return s
+
+    def test_a_client_that_asks_before_sending_is_told_no_before_it_sends(self):
+        # A NAS's own file manager uploads like this: "Expect: 100-continue",
+        # no password until it is asked for one, and no way of sending the
+        # file a second time. Told "continue" and then 401, it gives up and
+        # reports a lack of privileges. It has to be told 401 FIRST.
+        word = base64.b64encode(f"x:{ADMIN}".encode()).decode()
+        asking = ["PUT /Visible/asked.jpg HTTP/1.1", "Host: x", "Expect: 100-continue",
+                  f"Content-Length: {len(self.bytes)}"]
+        s = self._raw(asking)
+        first = s.recv(4096)
+        self.assertTrue(first.startswith(b"HTTP/1.1 401"), first[:40])
+        self.assertIn(b'WWW-Authenticate: Basic realm="Waterfall import"', first)
+        self.assertNotIn(b"100 Continue", first)
+        s.close()
+        self.assertFalse(os.path.exists(os.path.join(config.MEDIA_DIR, "Visible", "asked.jpg")))
+        # Asked again, with the password: now it is told to go ahead, and the file is taken.
+        s = self._raw(asking + [f"Authorization: Basic {word}"])
+        self.assertTrue(s.recv(4096).startswith(b"HTTP/1.1 100 Continue"))
+        s.sendall(self.bytes)
+        self.assertTrue(s.recv(4096).startswith(b"HTTP/1.1 201"))
+        s.close()
+        with open(os.path.join(config.MEDIA_DIR, "Visible", "asked.jpg"), "rb") as f:
+            self.assertEqual(f.read(), self.bytes)
+        self.assertEqual(self.ask("DELETE", "/Visible/asked.jpg")[0], 204)
+        # A wrong password is also told no before anything is sent, and counts as one guess.
+        wrong = base64.b64encode(b"x:not-it").decode()
+        s = self._raw(asking + [f"Authorization: Basic {wrong}"])
+        self.assertTrue(s.recv(4096).startswith(b"HTTP/1.1 401"))
+        s.close()
+        self.assertEqual(len(auth._FAILS.get("127.0.0.1", [])), 1)
 
     def test_many_requests_at_once_with_the_right_password_are_all_served(self):
         # What a file manager does when it copies a folder. Six used to get in

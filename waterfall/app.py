@@ -167,7 +167,8 @@ def me():
     have = role()
     return jsonify(configured=auth.is_configured(), role=have, admin=have == "admin",
                    has_viewer=auth.has_viewer(), version=__version__, pipeline=PIPELINE,
-                   simulated=config.SIMULATE_LINK or None)
+                   simulated=config.SIMULATE_LINK or None, admin_idle=config.ADMIN_IDLE,
+                   admin_left=auth.admin_seconds_left(request.cookies.get(auth.COOKIE)))
 
 
 @app.post("/api/setup")
@@ -350,11 +351,32 @@ def admin_retry():
     return jsonify(ok=True, retried=n)
 
 
-@app.post("/api/admin/upload")
+@app.post("/api/admin/touch")
 @need("admin")
+def admin_touch():
+    """The admin is still here: the page says so when it is touched, and the
+    sign-in is renewed. Nothing else renews it, so a page left open, or one
+    quietly asking for the library's status, lapses like any other."""
+    return _set_cookie(jsonify(ok=True, admin_left=config.ADMIN_IDLE), auth.issue("admin"))
+
+
+@app.post("/api/admin/upload-ticket")
+@need("admin")
+def admin_upload_ticket():
+    """Leave to go on uploading after the admin's sign-in has lapsed."""
+    return jsonify(ticket=auth.issue_ticket())
+
+
+@app.post("/api/admin/upload")
 def admin_upload():
     """One piece of one file, sent by the admin page from a phone or a laptop.
-    The pieces are put together, and the rules enforced, in uploads.py."""
+    The pieces are put together, and the rules enforced, in uploads.py. It is
+    open to the admin, and to a ticket the admin's page was given when the
+    upload began."""
+    if request.headers.get("X-Waterfall") != "1":
+        return jsonify(error="Bad request."), 400
+    if role() != "admin" and not auth.ticket_ok(request.headers.get("X-Upload-Ticket")):
+        return jsonify(error="That needs the admin password."), 403
     request.max_content_length = uploads.PIECE
     head = request.headers
     try:

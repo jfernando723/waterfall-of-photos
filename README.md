@@ -13,7 +13,7 @@ programming to find the errors in AI slop code. Nobody who could find them has l
 | **If you use it anyway** | It is entirely at your own risk. It handles your photos and removes files on purpose (see "Copy, never move" below). Nothing here is promised to work, to be safe, or to keep anything. |
 | **Updates** | Unlikely. Assume this is the last version there will ever be. The software it is built on will go out of date and nobody will repair it. |
 | **Support** | None. Zero. Issues and pull requests will most likely never be read. |
-| **Has it run on a real NAS?** | **Once, and only partly.** An earlier version was installed on the one machine it is built for. It started, used the video chip and showed its wall. Copying files in through the NAS's own file manager was refused there, and the reason has not been found. This version adds a second way in (uploading from the page) and a log that says what the import door refuses. Everything else below about a NAS is what it was designed to do, not what it has been seen to do. |
+| **Has it run on a real NAS?** | **Yes, on the one machine it is built for, and not all of it worked.** It starts, uses the video chip, shows its wall, takes uploads from its own page and converts them. Copying files in through the NAS's own file manager was refused there by every version up to 0.6.0; the cause was found in the log and this version is the cure, **not yet seen working there**. Everything else below about a NAS is what it was designed to do, not what it has been seen to do. |
 
 It is public for one reason: so that my own NAS can download it without my carrying a
 file to it. That is all.
@@ -38,14 +38,14 @@ No other machine has been considered.
 | | |
 |---|---|
 | Opening it | The address shows the **Visible** wall at once. No sign-in, no username. |
-| Admin | The **···** menu asks for the admin password. That opens the **Hidden** wall, the library status and the settings. |
+| Admin | The **···** menu asks for the admin password. That opens the **Hidden** wall, the library status and the settings. Left untouched for half an hour, the page signs the admin out by itself and goes back to the Visible wall. |
 | The wall | Every photo and video as a grid that never ends. Shuffle, Newest or Oldest; All, Photos or Videos. Video tiles play a few silent seconds. |
 | Sections | Each folder is a section; a folder inside a folder is a sub-section. |
 | Tags | The admin can tag an item so that it also appears in another section, without a second copy of the file. |
 | The viewer | One item per screen, one swipe per item. Pinch to zoom a photo. Videos choose their own quality from five sizes, 360p to 1440p, to suit the link. |
 | Details | When it was taken, the nearest town and country, the camera, and the copies that exist. |
 | Hidden | Decided by the folder and by nothing else. There are two roots, `Visible` and `Hidden`. What is copied into `Hidden` needs the admin password from the moment it arrives. |
-| Adding pictures | Two ways, both needing the admin password. From the admin page: choose photos and videos on a phone or a computer and they are uploaded, several hundred at a go if you like. Or from the NAS itself: its file manager copies folders in through the import door. |
+| Adding pictures | Two ways, both needing the admin password. From the admin page: pick a wall and a folder, choose photos and videos on a phone or a computer, and they are uploaded, several hundred at a go if you like. It shows how far it has got, how fast and how long is left; it waits out a dropped connection and carries on. Or from the NAS itself: its file manager copies folders in through the import door. |
 | Live Photos | A still and its short clip, copied in together under the same name, become one item: the photo, with a LIVE button. Hold a finger on the photo, or tap LIVE, and the clip plays over it. |
 
 Full-size files are never sent to the phone. Each one is converted once, in advance,
@@ -108,7 +108,7 @@ is made.
 ```
 git clone https://github.com/jfernando723/waterfall-of-photos.git
 cd waterfall-of-photos
-docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.6.0 .
+docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.6.1 .
 docker compose up -d
 ```
 
@@ -145,6 +145,7 @@ All of them go under `environment:` in `docker-compose.yml`. None is required.
 | `WATERFALL_ADMIN_PASSWORD` | not set | Sets the admin password on the very first start, so nobody else can reach the set-up page first. Ignored afterwards. |
 | `WATERFALL_VIEWER_PASSWORD` | not set | With the one above: also asks for a password before showing the Visible wall. |
 | `WATERFALL_KEEP_ORIGINALS` | `0` | `1` keeps the full-size files as well as the small copies. |
+| `WATERFALL_ADMIN_IDLE_MINUTES` | `30` | How long the admin stays signed in without touching the page. |
 | `WATERFALL_HWACCEL` | `auto` | `off` never tries the video chip. |
 | `WATERFALL_VAAPI_DEVICE` | `/dev/dri/renderD128` | Which device the video chip is. |
 | `WATERFALL_TRUSTED_PROXY` | not set | The address of a reverse proxy in front of Waterfall, if you have put one there to add https. |
@@ -161,9 +162,9 @@ the `Dockerfile`.
 | | |
 |---|---|
 | The machine it is built for | Installed there once, an earlier version. It started and showed its wall. Nothing has been converted there, so its speed is not known. |
-| Copying in from File Station | **Refused on that machine**, for every file, with a message about privileges, although File Station connected, listed the folders and made a new one. Not understood. This version makes the door say more about itself to a client, take five hundred connections at once, and log what it refuses; whether that cures it is not known. |
-| Uploading from the page | New in this version. Tried from a desktop browser with several hundred generated pictures. Not yet tried from an iPhone. |
-| Live Photos | New in this version. Tried with generated stills and clips only. |
+| Copying in from File Station | **Refused on that machine by every version up to 0.6.0**, for every file, with a message about privileges, although File Station connected, listed the folders and made a new one. The log of 0.6.0 showed why: File Station browses with one program and uploads with another, and the uploader asks permission before sending a file (`Expect: 100-continue`) and gives no password until asked. The door said "go ahead" before looking for the password, then refused part-way, and the uploader cannot send a file twice. This version looks for the password first. That cures an imitation of the uploader; **it has not yet been tried with File Station itself.** |
+| Uploading from the page | Works on that machine, from a computer and from an iPhone. From an iPhone a large video over a slow link is only as reliable as the phone staying awake: the page cannot stop it sleeping, though it carries on where it stopped when the page is looked at again. |
+| Live Photos | Work on that machine when the still and its clip are copied in together. A still without its clip is just a photo; nothing in the still says that a clip ever existed. |
 | The Intel video chip | Seen working once: on first start the admin page reported that it decodes and resizes on the chip (VAAPI). At start-up Waterfall converts a test clip through each driver and uses one only if the picture matches the software result; otherwise it converts in software and says so. No real video has been converted with it yet. |
 | Speed | Converting 4K phone video in software is slow: on the DS920+, estimated at fourteen to twenty-one times the length of the video. An estimate, not a measurement. |
 | Any other machine | Not considered. The memory ceiling, the video chip, the user and group numbers and the install steps are all the DS920+'s. |

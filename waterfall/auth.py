@@ -26,10 +26,14 @@ import time
 
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 
-from . import library
+from . import config, library
 
 COOKIE = "waterfall_session"
 MAX_AGE = 60 * 60 * 24 * 60          # sixty days on a phone before asking again
+# ...for a viewer. The admin's sign-in lasts only while the admin is using it
+# (config.ADMIN_IDLE): the page renews it when it is touched, and one that has
+# not been renewed for that long is worth no more than a viewer's.
+TICKET_AGE = 60 * 60 * 24            # an upload begun by the admin may take a day to finish
 MIN_LENGTH = 6
 
 # After a few wrong guesses an address has to wait. This is meant for a private
@@ -262,13 +266,47 @@ def issue(role: str) -> str:
     return _signer().dumps({"r": role, "e": _state()["epoch"]})
 
 
-def role_of(token: str | None) -> str | None:
+def _read(token: str | None) -> tuple[str | None, float]:
+    """(the role a sign-in cookie proves, how many seconds ago it was issued)."""
     if not token:
-        return None
+        return None, 0.0
     try:
-        data = _signer().loads(token, max_age=MAX_AGE)
+        data, when = _signer().loads(token, max_age=MAX_AGE, return_timestamp=True)
     except BadSignature:
-        return None
+        return None, 0.0
     if data.get("e") != _state()["epoch"]:
-        return None
-    return data.get("r") if data.get("r") in ("admin", "viewer") else None
+        return None, 0.0
+    role = data.get("r") if data.get("r") in ("admin", "viewer") else None
+    return role, max(0.0, time.time() - when.timestamp())
+
+
+def role_of(token: str | None) -> str | None:
+    role, age = _read(token)
+    if role == "admin" and age > config.ADMIN_IDLE:
+        return "viewer"         # left alone too long: what anyone may see, and no more
+    return role
+
+
+def admin_seconds_left(token: str | None) -> int:
+    """How long this admin sign-in still has, if nobody touches the page."""
+    role, age = _read(token)
+    return max(0, int(config.ADMIN_IDLE - age)) if role == "admin" else 0
+
+
+# An upload outlives the sign-in that began it. Sending a large video from a
+# phone can take hours, and the admin's sign-in is meant to lapse long before
+# that. So the page is given a ticket when an upload starts: it lets its holder
+# add files and do nothing else. It cannot open the Hidden wall, read the
+# library's status or change anything, and a change of password cancels it.
+def issue_ticket() -> str:
+    return URLSafeTimedSerializer(_state()["secret"], salt="waterfall-upload").dumps({"e": _state()["epoch"]})
+
+
+def ticket_ok(token: str | None) -> bool:
+    if not token:
+        return False
+    try:
+        data = URLSafeTimedSerializer(_state()["secret"], salt="waterfall-upload").loads(token, max_age=TICKET_AGE)
+    except BadSignature:
+        return False
+    return isinstance(data, dict) and data.get("e") == _state()["epoch"]

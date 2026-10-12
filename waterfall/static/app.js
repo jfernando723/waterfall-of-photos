@@ -19,6 +19,8 @@
       photo; holding a finger on it, or tapping LIVE, plays the clip over it.
    7. The admin can send files from this page, a few megabytes at a time, so a
       phone can add to the library without anything else installed.
+   8. Being the admin lasts only while the page is being used. Left untouched
+      for half an hour, it goes back to the wall everyone sees.
 */
 (() => {
   'use strict';
@@ -90,12 +92,23 @@
       showGate();
       throw new Error('Signed out.');
     }
+    if (response.status === 403 && isAdmin() && path.startsWith('/api/admin/')) {
+      // The admin sign-in has lapsed on the server. Go where that leaves us.
+      await refreshMe().catch(() => {});
+      if (!isAdmin()) setRealm('visible');
+    }
     if (!response.ok) throw new Error(data.error || `Something went wrong (${response.status}).`);
     return data;
   }
   async function refreshMe() {
+    const was = isAdmin();
     state.me = await (await fetch('/api/me', { credentials: 'same-origin' })).json();
     state.pipeline = state.me.pipeline;
+    if (state.me.admin && !was) {
+      // Newly the admin (or the page reloaded as one): the clock starts from
+      // whatever the sign-in itself has left.
+      lastActive = lastRenewed = Date.now() - Math.max(0, (state.me.admin_idle - state.me.admin_left) * 1000);
+    }
     if (!state.me.admin) state.realm = 'visible';
   }
   const murl = (item, name) => `/m/${state.pipeline}/${item.key}/${name}`;
@@ -125,6 +138,41 @@
     return s ? s.name : '';
   };
   const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
+
+  // ---------------------------------------------------------- admin idle --
+  // The admin stays the admin only while somebody is using the page. Touching
+  // it renews the sign-in; left alone for the time the server names (half an
+  // hour), the page signs out and shows the Visible wall, so a phone put down
+  // unlocked does not go on showing the Hidden one. Only a person counts:
+  // a video left playing or the status ticking over does not.
+  let lastActive = Date.now();
+  let lastRenewed = Date.now();
+  const idleLimit = () => ((state.me && state.me.admin_idle) || 1800) * 1000;
+  function noteActivity() {
+    lastActive = Date.now();
+    if (isAdmin() && lastActive - lastRenewed > 120000) {
+      lastRenewed = lastActive;
+      api('/api/admin/touch', {}).catch(() => {});
+    }
+  }
+  for (const type of ['pointerdown', 'keydown', 'wheel', 'touchstart', 'scroll']) {
+    window.addEventListener(type, noteActivity, { passive: true, capture: true });
+  }
+  let leaving = false;
+  async function leaveAdminIfIdle() {
+    if (leaving || !isAdmin() || Date.now() - lastActive < idleLimit()) return;
+    leaving = true;
+    try {
+      await api('/api/logout', {}).catch(() => {});
+      await refreshMe().catch(() => {});
+      if (!state.me || !state.me.role) showGate(); else await setRealm('visible');
+    } finally { leaving = false; }
+  }
+  setInterval(leaveAdminIfIdle, 15000);
+  // A phone's timers stop while it is asleep or the page is in the background,
+  // so the moment the page is looked at again is when this has to be asked.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) leaveAdminIfIdle(); });
+  window.addEventListener('pageshow', leaveAdminIfIdle);
 
   // ---------------------------------------------------------------- gate --
   // Normally nobody sees this: opening the address shows the wall. It appears
@@ -1356,8 +1404,10 @@
 
     body.appendChild(el('h3', '', 'Adding photos and videos'));
     body.appendChild(uploadPanel());
-    body.appendChild(el('p', 'muted small', 'Or, for files already on the machine Waterfall runs on:'));
-    body.appendChild(steps);
+    const fromNas = el('details', 'more');
+    fromNas.appendChild(el('summary', '', 'From the NAS itself'));
+    fromNas.appendChild(steps);
+    body.appendChild(fromNas);
 
     body.appendChild(el('h3', '', 'Passwords'));
     body.appendChild(passwordForm());
@@ -1418,24 +1468,36 @@
   }
 
   // -------------------------------------------------------------- upload --
-  // Files chosen on this device are sent a few megabytes at a time and put
-  // together on the server, so one dropped connection costs one piece and not
-  // the file. A few files travel at once; the rest wait their turn, which is
-  // what lets several hundred be chosen in one go. It carries on if the sheet
-  // is closed, and stops if the page is.
+  // Files chosen on this device are sent a piece at a time and put together on
+  // the server, so a dropped connection costs one piece and not the file. A few
+  // files travel at once; the rest wait their turn, which is what lets several
+  // hundred be chosen in one go.
+  //
+  // It is built for a phone on a slow link, which shapes three things. Progress
+  // is counted in bytes as they leave, not in finished pieces, so the number
+  // moves even when a piece takes a minute. A piece is sized to take a few
+  // seconds on the link as it is, so little is lost when one fails. And a
+  // connection that drops, as it does every time a phone sleeps, is waited for:
+  // the upload picks up where it stopped when the page is looked at again.
+  //
+  // It carries on when the sheet is closed (a pill on the wall shows it), and
+  // when the admin sign-in lapses (it holds a ticket for exactly this).
   const PHOTO_NAME = /\.(heic|heif|jpe?g|png|webp|gif|tiff?|avif)$/i;
   const VIDEO_NAME = /\.(mov|mp4|m4v|mkv|avi|webm|3gp|mts)$/i;
   const UP_AT_ONCE = 3;
+  const UP_SMALLEST = 256 * 1024;
   const up = { piece: 4 * 1024 * 1024, jobs: [], next: 0, active: 0, done: 0, skipped: 0, failed: [],
-               bytes: 0, sent: 0, running: false, stopped: false, startedAt: 0, note: '',
-               view: null, drawTimer: 0, wake: null };
+               bytes: 0, sent: 0, running: false, stopped: false, waiting: false, ticket: null,
+               rate: 0, rateAt: 0, rateSent: 0, where: '', note: '', realm: null, section: '',
+               view: null, drawTimer: 0, shownDone: false };
 
   function upReset() {
-    Object.assign(up, { jobs: [], next: 0, active: 0, done: 0, skipped: 0, failed: [],
-                        bytes: 0, sent: 0, running: false, stopped: false, startedAt: 0, note: '' });
+    Object.assign(up, { jobs: [], next: 0, active: 0, done: 0, skipped: 0, failed: [], bytes: 0, sent: 0,
+                        running: false, stopped: false, waiting: false, rate: 0, rateAt: 0, rateSent: 0,
+                        note: '', shownDone: false });
   }
 
-  function upAdd(files, realm, section) {
+  async function upAdd(files, realm, section) {
     if (!up.running) upReset();
     let left = 0;
     const fresh = [];
@@ -1443,7 +1505,7 @@
       const name = file.webkitRelativePath || file.name;
       if (name.split('/').some((part) => part.startsWith('.'))) continue;      // system clutter
       if (!PHOTO_NAME.test(file.name) && !VIDEO_NAME.test(file.name)) { left += 1; continue; }
-      fresh.push({ file, realm, path: (section ? section + '/' : '') + name, sent: 0,
+      fresh.push({ file, realm, path: (section ? section + '/' : '') + name, sent: 0, live: 0,
                    id: [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('') });
     }
     // Photos before videos: the wall fills sooner, and the still of a Live
@@ -1451,12 +1513,15 @@
     fresh.sort((a, b) => (VIDEO_NAME.test(a.file.name) - VIDEO_NAME.test(b.file.name)) || a.path.localeCompare(b.path));
     up.jobs.push(...fresh);
     up.bytes += fresh.reduce((sum, job) => sum + job.file.size, 0);
+    up.where = (realm === 'hidden' ? 'Hidden' : 'Visible') + ' › ' + (section || 'Unsorted');
     up.note = left ? `${plural(left, 'file')} left out: not a photo or video.` : '';
     if (fresh.length && !up.running) {
       up.running = true;
       up.stopped = false;
-      up.startedAt = performance.now();
-      if (navigator.wakeLock) navigator.wakeLock.request('screen').then((lock) => { up.wake = lock; }).catch(() => {});
+      up.rateAt = performance.now();
+      up.rateSent = 0;
+      upDraw();
+      try { up.ticket = (await api('/api/admin/upload-ticket', {})).ticket; } catch { up.ticket = null; }
     }
     upPump();
     upDraw();
@@ -1472,13 +1537,14 @@
       }).catch((error) => {
         up.sent -= job.sent;
         up.bytes -= job.file.size;
+        job.sent = job.live = 0;
         up.failed.push({ job, why: error.message });
       }).finally(() => {
         up.active -= 1;
         if (!up.active && (up.stopped || up.next >= up.jobs.length)) {
           up.running = false;
-          if (up.wake) { up.wake.release().catch(() => {}); up.wake = null; }
-          if (up.done > up.skipped) api('/api/admin/rescan', {}).catch(() => {});
+          up.waiting = false;
+          if (up.done > up.skipped && isAdmin()) api('/api/admin/rescan', {}).catch(() => {});
         }
         upPump();
         upDraw();
@@ -1490,68 +1556,151 @@
     const total = job.file.size;
     if (!total) throw new Error('The file is empty.');
     let offset = 0;
+    let piece = Math.min(up.piece, 512 * 1024);
     for (;;) {
       if (up.stopped) throw new Error('Stopped.');
-      const result = await upPiece(job, offset, total);
+      const began = performance.now();
+      const size = Math.min(piece, total - offset);
+      const result = await upPiece(job, offset, size, total);
       const now = result.done ? total : result.have;
       up.sent += now - job.sent;
       job.sent = now;
+      job.live = 0;
       offset = now;
       upDraw();
       if (result.done) return result;
+      // Aim for a piece that takes about six seconds on this link, today.
+      const seconds = Math.max(0.05, (performance.now() - began) / 1000);
+      piece = clamp(Math.round(size / seconds * 6), UP_SMALLEST, up.piece);
     }
   }
 
-  // One piece, tried again a few times if the link drops it. An answer that
-  // says no (wrong kind of file, no room, signed out) is not tried again.
-  async function upPiece(job, offset, total) {
+  // Wait before trying again, but not past the moment the phone wakes or the
+  // network comes back: that is exactly when to try.
+  function upWait(ms) {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        window.removeEventListener('online', done);
+        document.removeEventListener('visibilitychange', seen);
+        resolve();
+      };
+      const seen = () => { if (!document.hidden) done(); };
+      const timer = setTimeout(done, ms);
+      window.addEventListener('online', done);
+      document.addEventListener('visibilitychange', seen);
+    });
+  }
+
+  // One piece. A link that drops it is waited for and tried again for as long
+  // as the page lives; an answer that says no (wrong kind of file, no room,
+  // not allowed) is final for that file.
+  async function upPiece(job, offset, size, total) {
     let wait = 1000;
-    for (let attempt = 1; ; attempt++) {
-      let response = null;
-      try {
-        response = await fetch('/api/admin/upload?realm=' + job.realm, {
-          method: 'POST', credentials: 'same-origin',
-          headers: { 'X-Waterfall': '1', 'Content-Type': 'application/octet-stream',
-                     'X-Upload-Path': encodeURIComponent(job.path), 'X-Upload-Id': job.id,
-                     'X-Upload-Offset': String(offset), 'X-Upload-Total': String(total),
-                     'X-Upload-Modified': String(Math.round((job.file.lastModified || 0) / 1000)) },
-          body: job.file.slice(offset, offset + up.piece),
-        });
-      } catch { /* the link dropped it: try again below */ }
-      if (response && response.ok) return response.json();
-      if (response && response.status < 500 && response.status !== 408 && response.status !== 429) {
-        const data = await response.json().catch(() => ({}));
-        if (response.status === 401 || response.status === 403) { up.stopped = true; throw new Error('Signed out. Unlock admin and send it again.'); }
-        throw new Error(data.error || `Refused (${response.status}).`);
+    let asked = false;
+    for (;;) {
+      const answer = await upRequest(job, offset, size, total);
+      if (answer.status >= 200 && answer.status < 300) {
+        if (up.waiting) { up.waiting = false; upDraw(); }
+        return answer.data;
       }
-      if (attempt >= 5) throw new Error('The connection kept dropping.');
-      await new Promise((resolve) => setTimeout(resolve, wait));
-      wait *= 2.5;
+      job.live = 0;
+      if (answer.status === 403 && isAdmin() && !asked) {
+        // The ticket has gone stale (a change of password does that). Ask once more.
+        asked = true;
+        try { up.ticket = (await api('/api/admin/upload-ticket', {})).ticket; continue; } catch { /* below */ }
+      }
+      if (answer.status >= 400 && answer.status < 500 && answer.status !== 408 && answer.status !== 429) {
+        if (answer.status === 401 || answer.status === 403) {
+          up.stopped = true;
+          throw new Error('Not signed in as the admin. Unlock admin and send it again.');
+        }
+        throw new Error(answer.data.error || `Refused (${answer.status}).`);
+      }
+      if (up.stopped) throw new Error('Stopped.');
+      up.waiting = true;
+      upDraw();
+      await upWait(wait);
+      wait = Math.min(30000, wait * 2);
       if (up.stopped) throw new Error('Stopped.');
     }
   }
+
+  // The request itself. Not fetch(): only this older interface says how much
+  // of a body has left, and that is the number a person watching needs.
+  function upRequest(job, offset, size, total) {
+    return new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      let stalled = 0;
+      const quiet = () => {
+        clearTimeout(stalled);
+        stalled = setTimeout(() => xhr.abort(), 45000);      // nothing has moved: start the piece again
+      };
+      const finish = (status, data) => { clearTimeout(stalled); resolve({ status, data: data || {} }); };
+      xhr.open('POST', '/api/admin/upload?realm=' + job.realm);
+      xhr.withCredentials = true;
+      xhr.responseType = 'json';
+      xhr.setRequestHeader('X-Waterfall', '1');
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.setRequestHeader('X-Upload-Path', encodeURIComponent(job.path));
+      xhr.setRequestHeader('X-Upload-Id', job.id);
+      xhr.setRequestHeader('X-Upload-Offset', String(offset));
+      xhr.setRequestHeader('X-Upload-Total', String(total));
+      xhr.setRequestHeader('X-Upload-Modified', String(Math.round((job.file.lastModified || 0) / 1000)));
+      if (up.ticket) xhr.setRequestHeader('X-Upload-Ticket', up.ticket);
+      xhr.upload.onprogress = (event) => { job.live = Math.min(size, event.loaded); quiet(); upDraw(); };
+      xhr.onload = () => finish(xhr.status, xhr.response);
+      xhr.onerror = xhr.onabort = xhr.ontimeout = () => finish(0);
+      quiet();
+      xhr.send(job.file.slice(offset, offset + size));
+    });
+  }
+
+  // Everything the two displays need: how far, how fast, how long.
+  function upState() {
+    const live = up.jobs.reduce((sum, job) => sum + (job.live || 0), 0);
+    const sent = Math.min(up.bytes, up.sent + live);
+    const now = performance.now();
+    if (now - up.rateAt > 1000) {
+      const rate = Math.max(0, (sent - up.rateSent) / ((now - up.rateAt) / 1000));
+      up.rate = up.rate ? up.rate * 0.7 + rate * 0.3 : rate;
+      up.rateAt = now;
+      up.rateSent = sent;
+    }
+    const percent = up.bytes ? Math.min(100, Math.floor(sent / up.bytes * 100)) : 100;
+    const left = up.rate > 1000 && up.bytes > sent ? (up.bytes - sent) / up.rate : 0;
+    const finished = up.done + up.failed.length;
+    const state = up.running ? (up.waiting ? 'waiting' : 'sending')
+      : up.stopped ? 'stopped' : up.failed.length ? 'failed' : 'done';
+    return { sent, percent, left, finished, state, count: up.jobs.length };
+  }
+  const fmtLeft = (seconds) => seconds < 90 ? `${Math.max(1, Math.round(seconds))} s left`
+    : seconds < 5400 ? `${Math.round(seconds / 60)} min left` : `${(seconds / 3600).toFixed(1)} h left`;
+  const fmtRate = (rate) => rate >= 1e6 ? (rate / 1e6).toFixed(1) + ' MB/s' : Math.max(1, Math.round(rate / 1e3)) + ' KB/s';
 
   function upDraw() {
     if (up.drawTimer) return;
     up.drawTimer = setTimeout(() => {
       up.drawTimer = 0;
+      const u = upState();
+      upPill(u);
       const view = up.view;
       if (!view || !view.isConnected) return;
       view.textContent = '';
-      const count = up.jobs.length;
-      if (!count && !up.note) return;
-      if (count) {
-        const finished = up.done + up.failed.length;
-        let line = `${finished.toLocaleString()} of ${plural(count, 'file')} · ${fmtBytes(up.sent)} of ${fmtBytes(Math.max(up.bytes, up.sent))}`;
-        const seconds = (performance.now() - up.startedAt) / 1000;
-        if (up.running && seconds > 8 && up.sent > 0 && up.bytes > up.sent) {
-          line += ` · about ${fmtSpan((up.bytes - up.sent) / (up.sent / seconds))} left`;
-        }
-        view.appendChild(el('p', '', up.running ? 'Uploading. Keep this page open.' : up.stopped ? 'Stopped.'
-          : up.failed.length ? 'Finished, but not everything went.' : 'All of it is in. It appears on the wall as it is converted.'));
-        const meter = el('div', 'meter');
-        meter.appendChild(el('i')).style.width = (up.bytes ? Math.min(100, up.sent / up.bytes * 100) : 100) + '%';
-        view.append(meter, el('p', 'muted small', line));
+      if (!u.count && !up.note) return;
+      if (u.count) {
+        const head = el('div', 'up-head');
+        head.append(el('b', '', u.state === 'done' ? 'Done' : u.percent + '%'),
+          el('span', 'muted small', { sending: 'Uploading. Keep this page open.',
+            waiting: 'Waiting for the connection. It carries on by itself.', stopped: 'Stopped.',
+            failed: 'Finished, but not everything went.', done: 'It appears on the wall as it is converted.' }[u.state]));
+        const meter = el('div', 'meter' + (u.state === 'sending' ? ' busy' : ''));
+        meter.appendChild(el('i')).style.width = u.percent + '%';
+        const bits = [`${u.finished.toLocaleString()} of ${plural(u.count, 'file')}`,
+                      `${fmtBytes(u.sent)} of ${fmtBytes(Math.max(up.bytes, 1))}`];
+        if (u.state === 'sending' && up.rate > 1000) bits.push(fmtRate(up.rate));
+        if (u.state === 'sending' && u.left) bits.push(fmtLeft(u.left));
+        view.append(head, meter, el('p', 'muted small', bits.join(' · ')), el('p', 'muted small', 'To ' + up.where));
         if (up.skipped) view.appendChild(el('p', 'muted small', `${plural(up.skipped, 'file')} already here, so not sent again.`));
       }
       if (up.note) view.appendChild(el('p', 'muted small', up.note));
@@ -1563,48 +1712,82 @@
         view.appendChild(stop);
       } else if (up.failed.length) {
         const again = el('button', 'plain', 'Send the failed ones again');
-        again.addEventListener('click', () => {
-          const files = up.failed.map((f) => f.job);
+        again.addEventListener('click', async () => {
+          const jobs = up.failed.map((f) => Object.assign(f.job, { sent: 0, live: 0 }));
           upReset();
-          up.jobs = files.map((job) => Object.assign(job, { sent: 0 }));
-          up.bytes = up.jobs.reduce((sum, job) => sum + job.file.size, 0);
+          up.jobs = jobs;
+          up.bytes = jobs.reduce((sum, job) => sum + job.file.size, 0);
           up.running = true;
-          up.startedAt = performance.now();
+          up.rateAt = performance.now();
+          try { up.ticket = (await api('/api/admin/upload-ticket', {})).ticket; } catch { /* the old one may still do */ }
           upPump();
           upDraw();
         });
         view.appendChild(again);
       }
-    }, 150);
+    }, 200);
   }
-  window.addEventListener('beforeunload', (event) => { if (up.running) event.preventDefault(); });
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && up.running && navigator.wakeLock && !up.wake) {
-      navigator.wakeLock.request('screen').then((lock) => { up.wake = lock; }).catch(() => {});
-    }
+  // While anything is moving, redraw twice a second whether or not a piece
+  // has finished: the speed and the time left are only true if they are fresh.
+  setInterval(() => { if (up.running) upDraw(); }, 500);
+
+  // The pill: the upload, in a few characters, on the wall. It is what is left
+  // on screen when the sheet is closed, and it opens the sheet again.
+  function upPill(u) {
+    const pill = $('upload-pill');
+    const show = u.count > 0 && !(u.state === 'done' && up.shownDone);
+    pill.hidden = !show;
+    if (!show) return;
+    pill.className = 'upload-pill ' + u.state;
+    $('upload-pill-fill').style.width = (u.state === 'done' ? 100 : u.percent) + '%';
+    $('upload-pill-text').textContent = {
+      sending: `Uploading ${u.percent}%` + (u.left ? ` · ${fmtLeft(u.left)}` : ''),
+      waiting: `Upload waiting for the connection · ${u.percent}%`,
+      stopped: `Upload stopped at ${u.percent}%`,
+      failed: `Upload: ${plural(up.failed.length, 'file')} did not go`,
+      done: `Upload done · ${plural(up.done, 'file')}` }[u.state];
+  }
+  $('upload-pill').addEventListener('click', () => {
+    if (!up.running && !up.failed.length) { up.shownDone = true; upDraw(); return; }
+    if (isAdmin()) openSettings();
   });
+  window.addEventListener('beforeunload', (event) => { if (up.running) event.preventDefault(); });
 
   function uploadPanel() {
     const box = el('div', 'upload');
-    let realm = state.realm;
-    const section = el('input');
-    section.type = 'text';
-    section.placeholder = 'Section (blank for Unsorted)';
-    section.autocapitalize = 'words';
-    section.setAttribute('list', 'upload-sections');
-    const known = el('datalist');
-    known.id = 'upload-sections';
+    let realm = up.realm && (up.realm !== 'hidden' || isAdmin()) ? up.realm : state.realm;
+    // Where it goes: a wall, then a folder chosen from the ones there are, or a new one.
+    const folder = el('select');
+    folder.setAttribute('aria-label', 'Folder');
+    const fresh = el('input');
+    fresh.type = 'text';
+    fresh.placeholder = 'Name of the new folder';
+    fresh.autocapitalize = 'words';
+    fresh.enterKeyHint = 'done';
+    fresh.hidden = true;
     const offer = async () => {
-      known.textContent = '';
+      let sections = [];
       try {
-        const data = realm === state.realm ? { sections: state.sections } : await api('/api/sections?realm=' + realm);
-        for (const sec of data.sections) if (sec.path) known.appendChild(el('option')).value = sec.path;
-      } catch { /* typing a name still works */ }
+        sections = (realm === state.realm ? state.sections : (await api('/api/sections?realm=' + realm)).sections);
+      } catch { /* a new folder can still be named */ }
+      folder.textContent = '';
+      const add = (value, label) => { const o = el('option', '', label); o.value = value; folder.appendChild(o); return o; };
+      add('', 'No folder (Unsorted)');
+      for (const sec of sections) if (sec.path) add(sec.path, '  '.repeat(sec.depth) + sec.name);
+      add('\n', 'New folder…');
+      if (realm === up.realm && [...folder.options].some((o) => o.value === up.section)) folder.value = up.section;
+      fresh.hidden = folder.value !== '\n';
     };
+    folder.addEventListener('change', () => {
+      fresh.hidden = folder.value !== '\n';
+      if (!fresh.hidden) fresh.focus();
+    });
     offer();
-    box.appendChild(option('Send to', segmented([['visible', 'Visible'], ['hidden', 'Hidden']], realm,
+    box.appendChild(option('Wall', segmented([['visible', 'Visible'], ['hidden', 'Hidden']], realm,
       (picked) => { realm = picked; offer(); })));
-    box.append(section, known);
+    box.appendChild(option('Folder', folder));
+    box.appendChild(fresh);
+    const note = el('p', 'error');
 
     const picker = (label, whole) => {
       const input = el('input');
@@ -1615,11 +1798,22 @@
       // Naming HEIC outright asks an iPhone for the photo as it was taken
       // instead of a JPEG made from it.
       else input.accept = 'image/*,video/*,.heic,.heif,.mov,.mp4,.m4v';
-      const button = el('button', 'plain', label);
+      const button = el('button', 'plain' + (whole ? '' : ' primary-ish'), label);
       button.type = 'button';
-      button.addEventListener('click', () => input.click());
+      button.addEventListener('click', () => {
+        note.textContent = '';
+        if (folder.value === '\n' && !fresh.value.trim()) {
+          note.textContent = 'Type a name for the new folder first.';
+          fresh.focus();
+          return;
+        }
+        input.click();
+      });
       input.addEventListener('change', () => {
-        const where = section.value.split('/').map((part) => part.trim()).filter(Boolean).join('/');
+        const typed = folder.value === '\n' ? fresh.value : folder.value;
+        const where = typed.split('/').map((part) => part.trim()).filter(Boolean).join('/');
+        up.realm = realm;
+        up.section = where;
         upAdd([...input.files], realm, where);
         input.value = '';
       });
@@ -1630,9 +1824,7 @@
     if ('webkitdirectory' in HTMLInputElement.prototype && window.matchMedia('(pointer: fine)').matches) {
       picker('Choose a whole folder', true);
     }
-    box.appendChild(el('p', 'muted small', 'Uploading copies: what you choose stays on this device. '
-      + 'From an iPhone\'s photo library a Live Photo arrives as a still, and the iPhone may shrink videos; '
-      + 'a computer sends files exactly as they are.'));
+    box.appendChild(note);
     up.view = box.appendChild(el('div', 'upload-progress'));
     upDraw();
     return box;
