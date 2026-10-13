@@ -258,6 +258,18 @@ details.more summary { cursor: pointer; padding: 6px 0; }
 .steps li { margin: 4px 0; }
 .steps b { color: var(--text); font-weight: 600; }
 
+/* A mouse or a trackpad. overscroll-behavior is there for touch screens, and
+   with a trackpad it does harm: Firefox chooses what a two-finger swipe will
+   move from the swipe's first event, which has no movement in it yet, and
+   with that rule on what is under the pointer it gives the swipe to the wall
+   behind a sheet, or to nothing at all in the viewer. So here the rule is
+   dropped up and down, and the page behind a sheet is held still instead, as
+   it already is behind the viewer. That leaves a swipe nothing else to move. */
+@media (hover: hover) and (pointer: fine) {
+  .deck, .sheet { overscroll-behavior-y: auto; }
+  body.sheet-open { overflow: hidden; }
+}
+
 @media (min-width: 700px) {
   :root { --gap: 5px; }
   .sheet { left: 50%; right: auto; width: 520px; margin-left: -260px;

@@ -13,7 +13,7 @@ programming to find the errors in AI slop code. Nobody who could find them has l
 | **If you use it anyway** | It is entirely at your own risk. It handles your photos and removes files on purpose (see "Copy, never move" below). Nothing here is promised to work, to be safe, or to keep anything. |
 | **Updates** | Unlikely. Assume this is the last version there will ever be. The software it is built on will go out of date and nobody will repair it. |
 | **Support** | None. Zero. Issues and pull requests will most likely never be read. |
-| **Has it run on a real NAS?** | **Yes, on the one machine it is built for, and not all of it worked.** It starts, uses the video chip, shows its wall, takes uploads from its own page and converts them. Copying files in through the NAS's own file manager was refused there by every version up to 0.6.0; the cause was found in the log and this version is the cure, **not yet seen working there**. Everything else below about a NAS is what it was designed to do, not what it has been seen to do. |
+| **Has it run on a real NAS?** | **Yes, on the one machine it is built for.** It starts, uses the video chip, shows its wall, takes uploads from its own page, takes copies from the NAS's own file manager (since 0.6.1; every version before refused them) and converts what it is given. That is one machine, for a few days. Nothing below has been seen anywhere else. |
 
 It is public for one reason: so that my own NAS can download it without my carrying a
 file to it. That is all.
@@ -38,12 +38,13 @@ No other machine has been considered.
 | | |
 |---|---|
 | Opening it | The address shows the **Visible** wall at once. No sign-in, no username. |
-| Admin | The **···** menu asks for the admin password. That opens the **Hidden** wall, the library status and the settings. Left untouched for half an hour, the page signs the admin out by itself and goes back to the Visible wall. |
+| Admin | The **···** menu asks for the admin password. That opens the admin menu: the library status, adding pictures, and the switch to the **Hidden** wall. Signing in does not change the wall; the Hidden one is shown only when that switch is used. Left untouched for half an hour, the page signs the admin out by itself and goes back to the Visible wall. |
 | The wall | Every photo and video as a grid that never ends. Shuffle, Newest or Oldest; All, Photos or Videos. Video tiles play a few silent seconds. |
 | Sections | Each folder is a section; a folder inside a folder is a sub-section. |
 | Tags | The admin can tag an item so that it also appears in another section, without a second copy of the file. |
 | The viewer | One item per screen, one swipe per item. Pinch to zoom a photo. Videos choose their own quality from five sizes, 360p to 1440p, to suit the link. |
 | Details | When it was taken, the nearest town and country, the camera, and the copies that exist. |
+| Removing | Not from the page: it shows and never deletes, so that it can be put in a child's hands. The admin removes things where they were copied in, through the import door. |
 | Hidden | Decided by the folder and by nothing else. There are two roots, `Visible` and `Hidden`. What is copied into `Hidden` needs the admin password from the moment it arrives. |
 | Adding pictures | Two ways, both needing the admin password. From the admin page: pick a wall and a folder, choose photos and videos on a phone or a computer, and they are uploaded, several hundred at a go if you like. It shows how far it has got, how fast and how long is left; it waits out a dropped connection and carries on. Or from the NAS itself: its file manager copies folders in through the import door. |
 | Live Photos | A still and its short clip, copied in together under the same name, become one item: the photo, with a LIVE button. Hold a finger on the photo, or tap LIVE, and the clip plays over it. |
@@ -108,7 +109,7 @@ is made.
 ```
 git clone https://github.com/jfernando723/waterfall-of-photos.git
 cd waterfall-of-photos
-docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.6.1 .
+docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.6.2 .
 docker compose up -d
 ```
 
@@ -126,9 +127,17 @@ converts in software and says so on its admin page.
 
 If a file manager will not copy something in through the import door, the container's log
 says what the door refused and why (on a Synology NAS: Container Manager → Container →
-`waterfall` → Log). With `WATERFALL_DAV_LOG: "1"` it writes down every request, and the
-compose text here has that switched on for now, for the reason given at the top of this
-page. It never writes a file or folder name.
+`waterfall` → Log). Setting `WATERFALL_DAV_LOG: "1"` makes it write down every request.
+It never writes a file or folder name. From 0.6.2 the door never waits for its log: lines
+that cannot be written are dropped and counted.
+
+**After a power cut, or a copy that stopped part-way, copy the same folders in again, to
+the same place, choosing Overwrite.** A file is recognised by its content: what is already
+converted is not converted again and does not appear twice, and what was missing or damaged
+is made. Then press **Look for new files now** on the admin page. From 0.6.2 that also
+checks the small copies of everything finished, and the page says what it found
+(**Checked**), what failed and why (**Failed**), and what is in the folders without being
+an item (**Left alone**).
 
 **From an iPhone**, the page can only be given what Safari hands it: a Live Photo chosen
 from the photo library arrives as a still without its clip, and the phone may shrink a
@@ -162,14 +171,18 @@ the `Dockerfile`.
 | | |
 |---|---|
 | The machine it is built for | Installed there once, an earlier version. It started and showed its wall. Nothing has been converted there, so its speed is not known. |
-| Copying in from File Station | **Refused on that machine by every version up to 0.6.0**, for every file, with a message about privileges, although File Station connected, listed the folders and made a new one. The log of 0.6.0 showed why: File Station browses with one program and uploads with another, and the uploader asks permission before sending a file (`Expect: 100-continue`) and gives no password until asked. The door said "go ahead" before looking for the password, then refused part-way, and the uploader cannot send a file twice. This version looks for the password first. That cures an imitation of the uploader; **it has not yet been tried with File Station itself.** |
+| Copying in from File Station | **Refused on that machine by every version up to 0.6.0**, for every file, with a message about privileges, although File Station connected, listed the folders and made a new one. The log of 0.6.0 showed why: File Station browses with one program and uploads with another, and the uploader asks permission before sending a file (`Expect: 100-continue`) and gives no password until asked. The door said "go ahead" before looking for the password, then refused part-way, and the uploader cannot send a file twice. Since 0.6.1 the door looks for the password first, and File Station copies in. |
 | Uploading from the page | Works on that machine, from a computer and from an iPhone. From an iPhone a large video over a slow link is only as reliable as the phone staying awake: the page cannot stop it sleeping, though it carries on where it stopped when the page is looked at again. |
+| A bulk upload from Safari on a Mac | On that machine, on 0.6.1, one stalled at 0%: every piece Safari sent was accepted, and the page never heard so. Stop did nothing that could be seen. The same page, engine and files finish against a copy on the Mac itself, so the cause was never found. From 0.6.2 a piece that wholly left and was never answered is sent again the plain way, Stop stops at once, and the page says that no answer came back instead of blaming the connection. Not yet tried against that machine. |
+| Several File Station copy jobs at once | On that machine, on 0.6.1, they stopped after 178 files and sat there all night. The door's log shows it answered every request it was sent, with nothing refused and no file left half-sent, and went on answering afterwards: File Station stopped sending. One folder at a time has worked since. Why several at once stop is not known. |
+| A log that nothing is reading | With `WATERFALL_DAV_LOG` on, it stopped the door for good while the wall went on working. Found on a test machine and closed in 0.6.2; not what happened above. |
+| A power cut | From 0.6.2 a full-size file is removed only once its small copies are on the disk, a record of small copies is believed only with the copies, and every finished item is checked when Waterfall starts. Tried against imitations of what a power cut leaves, never against a real one. Up to 0.6.1 a copy damaged that way stayed on the wall as a broken picture, the admin page said all was well, and copying the file in again did not mend it. |
 | Live Photos | Work on that machine when the still and its clip are copied in together. A still without its clip is just a photo; nothing in the still says that a clip ever existed. |
 | The Intel video chip | Seen working once: on first start the admin page reported that it decodes and resizes on the chip (VAAPI). At start-up Waterfall converts a test clip through each driver and uses one only if the picture matches the software result; otherwise it converts in software and says so. No real video has been converted with it yet. |
 | Speed | Converting 4K phone video in software is slow: on the DS920+, estimated at fourteen to twenty-one times the length of the video. An estimate, not a measurement. |
 | Any other machine | Not considered. The memory ceiling, the video chip, the user and group numbers and the install steps are all the DS920+'s. |
 | Place names | The list is GeoNames' places of 500 people or more, plus every named village in Sierra Leone and in Chad, plus a short hand-made list of names in Sierra Leone. Those are the places it was made for. Anywhere else, somewhere too small for the list is named for the nearest town on it within 120 km, or not at all. `scripts/make-places.py` rebuilds the list for other countries. |
-| Browsers | Made for Safari on an iPhone. Other browsers were not a goal. |
+| Browsers | Made for Safari on an iPhone. On a computer it has been tried in Firefox, Safari and Chrome on one Mac. Until 0.6.2, two fingers on a trackpad in Firefox would not scroll the settings sheet (the wall behind it moved instead) or move the viewer on. |
 | Upgrades | No upgrade between versions has ever been tested with a library in it. |
 | The ready-made image | Built once and left. Its ffmpeg, ExifTool and everything else in it stay at the versions of that day. |
 

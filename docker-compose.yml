@@ -19,7 +19,7 @@
 
 services:
   waterfall:
-    image: ghcr.io/jfernando723/waterfall-of-photos:0.6.1
+    image: ghcr.io/jfernando723/waterfall-of-photos:0.6.2
     container_name: waterfall
     restart: unless-stopped
 
@@ -62,13 +62,12 @@ services:
       # WATERFALL_ADMIN_PASSWORD: "choose-a-long-one"
       # Optional. Keep the full-size files as well as the small copies.
       # WATERFALL_KEEP_ORIGINALS: "1"
-      # The import door always writes a line to this container's log for a
-      # request it refuses. With this it writes one for EVERY request: what
-      # was asked and what was answered, never a file or folder name. It is
-      # ON here because the one machine this is built for has refused every
-      # file its file manager tried to copy in, and this is how the reason
-      # will be found. Delete the line once copying in works.
-      WATERFALL_DAV_LOG: "1"
+      # Optional. The import door always writes a line to this container's
+      # log for a request it refuses. With this it writes one for EVERY
+      # request: what was asked and what was answered, never a file or folder
+      # name. It is how a file manager's refusal on the machine this is built
+      # for was explained.
+      # WATERFALL_DAV_LOG: "1"
 
     # ---- containment ----------------------------------------------------
     # The image already runs as a non-root user, so there is no `user:` line

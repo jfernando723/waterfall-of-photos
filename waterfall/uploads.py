@@ -104,6 +104,11 @@ def receive(realm: str, rel: str, upload_id: str, offset: int, total: int,
     try:
         have = os.path.getsize(temp)
     except OSError:
+        if _already_here(folder, name, total):
+            # Its last piece was taken and the file given its name, and the
+            # answer saying so never reached the page, which has sent the
+            # piece again. That is a finished file, not a fault.
+            return {"have": total, "done": True, "skipped": False, "name": name}
         raise Refused(409, "That upload is not known here any more. Start the file again.") from None
     if have != offset:
         # A piece sent twice, or one that never arrived: say where the file
@@ -111,6 +116,11 @@ def receive(realm: str, rel: str, upload_id: str, offset: int, total: int,
         return {"have": have, "done": False, "resume": True}
     with open(temp, "ab") as f:
         f.write(data)
+        if have + len(data) >= total:
+            # The last piece: on the disk before the file is given its name
+            # (the import door does the same, and says why).
+            f.flush()
+            os.fsync(f.fileno())
     have += len(data)
     if have < total:
         return {"have": have, "done": False}

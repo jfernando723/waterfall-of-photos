@@ -339,7 +339,10 @@ def admin_status():
 @app.post("/api/admin/rescan")
 @need("admin")
 def admin_rescan():
-    worker.rescan_now()
+    """Look at the folders again. With `check`, which the button on the admin
+    page sends, also look at the small copies of everything already finished;
+    the look an upload asks for when it ends does not."""
+    worker.rescan_now(check=bool((request.get_json(silent=True) or {}).get("check")))
     return jsonify(ok=True)
 
 

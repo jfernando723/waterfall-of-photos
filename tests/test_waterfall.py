@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import io
 import json
 import os
 import resource
@@ -390,7 +391,7 @@ class TestRecipeUpgrade(unittest.TestCase):
         folder = media.deriv_dir(key)
         os.makedirs(os.path.join(folder, "v"))
         rungs = [{"name": n, "w": 1, "h": 1, "bytes": 1, "peak": 1, "avg": 1, "codecs": "x"} for n in ("360", "1080")]
-        for name in ("v/360.m4s", "p.mp4"):
+        for name in ("t.webp", "m.webp", "p.mp4", "v/360.m4s", "v/360.m3u8", "v/1080.m4s", "v/1080.m3u8"):
             with open(os.path.join(folder, name), "wb") as f:
                 f.write(b"x")
         old = {"pipeline": 2, "kind": "video", "width": 2160, "height": 3840, "duration": 5.0,
@@ -410,6 +411,10 @@ class TestRecipeUpgrade(unittest.TestCase):
         reset(width=1080, height=1920)
         self.assertEqual(library._upgrade_done(key, "video", have_original=True)["pipeline"], PIPELINE,
                          "a 1080p original could never have a 1440p size: nothing to redo")
+        os.remove(os.path.join(folder, "v", "1080.m4s"))
+        reset()
+        self.assertIsNone(library._upgrade_done(key, "video", have_original=False),
+                          "an old record is kept only if every copy it names is really there")
         shutil.rmtree(folder)
 
 
@@ -1013,6 +1018,55 @@ class TestHTTP(unittest.TestCase):
         self.assertNotRegex(page, r"(src|href)=\"(https?:)?//")
         self.assertEqual(self.client().get("/api/me").headers["X-Frame-Options"], "DENY")
 
+    def test_a_trackpad_can_scroll_a_sheet_and_the_viewer(self):
+        # Found in Firefox on a Mac: two fingers on the trackpad over the
+        # settings sheet moved the wall behind it and left the sheet still, and
+        # in the viewer moved nothing. The cause was overscroll-behavior on what
+        # was under the pointer; the cure is to drop it where the pointer is a
+        # mouse or a trackpad and hold the page behind a sheet still instead.
+        # No test here can swipe. This only keeps the cure from being undone.
+        css = self.client().get("/static/app.css").get_data(as_text=True)
+        self.assertRegex(css, r"@media \(hover: hover\) and \(pointer: fine\) \{\s*"
+                              r"\.deck, \.sheet \{ overscroll-behavior-y: auto; \}\s*"
+                              r"body\.sheet-open \{ overflow: hidden; \}")
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        self.assertIn("holdPage(true)", js, "opening a sheet must hold the page behind it")
+        self.assertIn("holdPage(false)", js, "and closing it must let go")
+        start = js.index("$('backdrop').addEventListener('wheel'")
+        beside = js[start:js.index("{ passive: true });", start)]
+        self.assertNotIn("preventDefault", beside,
+                         "refusing a wheel event left Firefox ignoring every later swipe over the sheet")
+
+    def test_signing_in_as_the_admin_leaves_the_visible_wall_showing(self):
+        # Asked for outright: somebody who signs in to add pictures to the
+        # Visible wall must not be shown the Hidden one for it. The Hidden wall
+        # appears only when the Wall switch in the menu is used. No test here
+        # can click; this keeps the sign-in from switching walls again.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        unlock = js[js.index("function unlockForm(body)"):js.index("function adminPanel(body)")]
+        self.assertNotIn("setRealm", unlock)
+        self.assertIn("openSettings()", unlock, "it shows the admin menu instead")
+        self.assertEqual(js.count("setRealm('hidden')"), 0, "nothing chooses the Hidden wall but the switch")
+
+    def test_the_admin_page_is_told_what_a_look_found_and_what_a_check_found(self):
+        c = self.client(ADMIN)
+        found = c.get("/api/admin/status").get_json()["worker"]
+        self.assertIn("checked", found)
+        self.assertIn("last_scan", found)
+        from waterfall.app import worker
+        was = worker._check
+        try:
+            worker._check = False
+            self.assertEqual(c.post("/api/admin/rescan", json={}, headers={"X-Waterfall": "1"}).status_code, 200)
+            self.assertFalse(worker._check, "the look an upload asks for when it ends")
+            self.assertEqual(c.post("/api/admin/rescan", json={"check": True}, headers={"X-Waterfall": "1"}).status_code, 200)
+            self.assertTrue(worker._check, "the button on the admin page")
+        finally:
+            worker._check = was
+        js = c.get("/static/app.js").get_data(as_text=True)
+        self.assertIn("api('/api/admin/rescan', { check: true })", js)
+        self.assertIn("No answer came back.", js, "an upload that hears nothing does not blame the connection")
+
     def test_a_request_far_larger_than_a_password_is_refused(self):
         from waterfall.app import MAX_BODY
         r = self.client().post("/api/login", data=b"x" * (MAX_BODY + 1),
@@ -1202,6 +1256,8 @@ class TestSmallCopiesOnly(unittest.TestCase):
         self.assertTrue(real(key, done))
         os.truncate(os.path.join(media.deriv_dir(key), "m.webp"), 10)
         self.assertFalse(real(key, done), "a copy that is the wrong size is not a copy")
+        shutil.rmtree(folder)               # the tests after this one count what is converted
+        convert_everything()
 
     def test_4_the_index_can_be_rebuilt_from_stand_ins_alone(self):
         before = {library.item(i, True)["name"]: library.item(i, True)["key"] for i in ids("visible")}
@@ -1267,6 +1323,111 @@ class TestSmallCopiesOnly(unittest.TestCase):
         convert_everything()
         failed = {f["rel_path"]: f["error"] for f in library.failures()}
         self.assertIn("Import it again", failed.get("Visible/Trip/IMG_8003.HEIC", ""))
+
+    def _fresh(self, name, label):
+        """One more converted photo in a folder of its own: its bytes, where it
+        was, and its key."""
+        path = fixtures.photo(os.path.join(config.MEDIA_DIR, "Visible", "Cut", name), 1200, 900, label)
+        with open(path, "rb") as f:
+            data = f.read()
+        convert_everything()
+        self.assertFalse(os.path.exists(path))
+        return data, path, item_named(name)["key"]
+
+    def test_8_copies_are_on_the_disk_before_the_full_size_file_goes(self):
+        # What a program writes is not on the disk for some seconds. Removing
+        # the full-size file inside those seconds, with a power cut inside them
+        # too, would leave a stand-in and nothing behind it.
+        folder = os.path.join(config.MEDIA_DIR, "Visible", "Durable")
+        fixtures.photo(os.path.join(folder, "IMG_8020.jpg"), 1200, 900, "durable")
+        order, real_disk, real_remove = [], library._to_disk, os.remove
+        library._to_disk = lambda p: (order.append(("disk", os.path.basename(p))), real_disk(p))[1]
+        os.remove = lambda p, *a, **k: (order.append(("remove", os.path.basename(p))), real_remove(p, *a, **k))[1]
+        try:
+            convert_everything()
+        finally:
+            library._to_disk, os.remove = real_disk, real_remove
+        gone = order.index(("remove", "IMG_8020.jpg"))
+        before = {name for what, name in order[:gone] if what == "disk"}
+        self.assertLessEqual({"t.webp", "m.webp", "l.webp", "done.json", "Durable"}, before,
+                             "every copy, their record and the stand-in's name, before the file is removed")
+
+    def test_9a_a_copy_damaged_behind_a_good_record_is_found_and_mended_by_importing_again(self):
+        # The record of the copies is written last and is tiny, so it can
+        # survive a power cut that a copy did not. Nothing used to look again.
+        data, path, key = self._fresh("IMG_8030.jpg", "cut")
+        self.assertEqual(library.verify()["damaged"], 0)
+        with open(os.path.join(media.deriv_dir(key), "m.webp"), "wb"):
+            pass                                            # as the power cut left it
+        found = library.verify()
+        self.assertEqual(found["damaged"], 1)
+        self.assertGreaterEqual(found["items"], 3)
+        convert_everything()
+        failed = {f["rel_path"]: f["error"] for f in library.failures()}
+        self.assertIn("Import it again", failed.get("Visible/Cut/IMG_8030.jpg", ""),
+                      "the full-size file has gone, so it says so instead of showing a broken picture")
+        self.assertNotIn("IMG_8030.jpg", {library.item(i, True)["name"] for i in ids("visible")})
+        with open(path, "wb") as f:                         # copied in again, same place
+            f.write(data)
+        convert_everything()
+        self.assertEqual(item_named("IMG_8030.jpg")["key"], key)
+        self.assertGreater(os.path.getsize(os.path.join(media.deriv_dir(key), "m.webp")), 0, "made again")
+        self.assertFalse(os.path.exists(path), "and the full-size file removed again, not left beside its stand-in")
+        self.assertEqual(library.verify()["damaged"], 0)
+
+    def test_9b_an_index_behind_the_folders_reads_the_key_from_the_stand_in(self):
+        # The index is the last thing to reach the disk. After a power cut it
+        # can say "not converted yet" of an item whose copies are whole.
+        data, path, key = self._fresh("IMG_8031.jpg", "behind")
+        con = library.connect()
+        with con:
+            con.execute("UPDATE items SET status='new', key=NULL, trashed=0, info=NULL WHERE name='IMG_8031.jpg'")
+        calls, real = [], media.make_photo
+        media.make_photo = lambda *a, **k: calls.append(1) or real(*a, **k)
+        try:
+            convert_everything()
+        finally:
+            media.make_photo = real
+        self.assertEqual(calls, [], "nothing needed making")
+        self.assertEqual(item_named("IMG_8031.jpg")["key"], key)
+        self.assertTrue(item_named("IMG_8031.jpg")["trashed"])
+
+    def test_9c_what_is_in_the_folders_without_being_an_item_is_counted(self):
+        folder = os.path.join(config.MEDIA_DIR, "Visible", "Cut")
+        before = library.scan()
+        open(os.path.join(folder, "IMG_8040.jpg"), "wb").close()            # a name with nothing in it
+        with open(os.path.join(folder, ".IMG_8041.jpg.part-0a1b2c3d"), "wb") as f:
+            f.write(b"half")                                                # stopped half-way in
+        with open(os.path.join(folder, "notes.txt"), "w") as f:
+            f.write("not a picture")
+        after = library.scan()
+        self.assertEqual([after[k] - before[k] for k in ("empty", "partial", "other", "total")], [1, 1, 1, 0])
+        for name in ("IMG_8040.jpg", ".IMG_8041.jpg.part-0a1b2c3d", "notes.txt"):
+            os.remove(os.path.join(folder, name))
+
+    def test_9d_the_converter_checks_at_its_start_and_when_the_admin_asks(self):
+        from waterfall.worker import Worker
+        w = Worker()
+
+        def tick():
+            w._wake.set()                   # so that an idle converter returns instead of waiting
+            w._tick()
+
+        tick()
+        self.assertEqual(w.state["checked"]["damaged"], 0, "checked once, as it starts")
+        data, path, key = self._fresh("IMG_8032.jpg", "asked")
+        os.truncate(os.path.join(media.deriv_dir(key), "l.webp"), 5)
+        first = w.state["checked"]["at"]
+        w.rescan_now()                      # the look an upload or the door asks for
+        tick()
+        self.assertEqual(w.state["checked"]["at"], first, "an ordinary look does not check every copy")
+        w.rescan_now(check=True)            # the button on the admin page
+        tick()
+        self.assertEqual(w.state["checked"]["damaged"], 1)
+        for _ in range(library.MAX_ATTEMPTS):
+            tick()
+        self.assertIn("Visible/Cut/IMG_8032.jpg", {f["rel_path"] for f in library.failures()})
+        library.close()
 
 
 class TestLivePhotos(unittest.TestCase):
@@ -1451,6 +1612,38 @@ class TestUploads(unittest.TestCase):
         self.assertTrue(os.path.exists(self.where("Visible", "Same", "a.jpg.waterfall.txt")))
         late = self.send(c, "Same%2Fa.jpg", self.bytes[:100], 0, len(self.bytes), upload_id="3" * 16).get_json()
         self.assertEqual((late["done"], late["skipped"]), (True, True))
+
+    def test_a_last_piece_sent_again_because_its_answer_was_lost_is_a_finished_file(self):
+        # Seen from Safari on a Mac: the server took every piece and said so,
+        # and the page never heard. A page that sends the last piece again must
+        # be told the file is there, not that the upload is unknown.
+        c = self.admin()
+        half = len(self.bytes) // 2
+        first = self.send(c, "Lost%2Fb.jpg", self.bytes[:half], 0, len(self.bytes), upload_id="4" * 16).get_json()
+        self.assertEqual((first["have"], first["done"]), (half, False))
+        self.assertTrue(self.send(c, "Lost%2Fb.jpg", self.bytes[half:], half, len(self.bytes), upload_id="4" * 16).get_json()["done"])
+        again = self.send(c, "Lost%2Fb.jpg", self.bytes[half:], half, len(self.bytes), upload_id="4" * 16)
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual((again.get_json()["done"], again.get_json()["name"]), (True, "b.jpg"))
+        self.assertEqual(os.listdir(self.where("Visible", "Lost")), ["b.jpg"], "one file, and nothing half-made beside it")
+        with open(self.where("Visible", "Lost", "b.jpg"), "rb") as f:
+            self.assertEqual(f.read(), self.bytes)
+        # A piece of an upload that really is unknown is still refused.
+        self.assertEqual(self.send(c, "Lost%2Fc.jpg", b"x" * 10, 10, 30, upload_id="5" * 16).status_code, 409)
+
+    def test_stop_stops_at_once_and_an_unanswered_piece_changes_the_way_of_sending(self):
+        # No test here can click. These keep two cures from being undone: Stop
+        # used to wait for the piece in hand, which on a stalled upload was for
+        # ever as far as anyone watching could tell; and a piece that wholly
+        # left and was never answered is sent the plain way from then on.
+        js = self.app.test_client().get("/static/app.js").get_data(as_text=True)
+        stop = js[js.index("function upStop()"):js.index("// One piece.")]
+        self.assertIn("going.abort()", stop)
+        self.assertIn("wake()", stop)
+        self.assertIn("stop.addEventListener('click', upStop)", js)
+        self.assertIn("const state = up.stopped ? 'stopped'", js, "it says so at once")
+        self.assertIn("if (answer.unanswered) up.plain = true;", js)
+        self.assertIn("if (up.plain) return upRequestPlain(job, offset, size, total);", js)
 
     def test_only_photos_and_videos_and_only_inside_the_two_walls(self):
         c = self.admin()
@@ -1807,6 +2000,63 @@ class TestImportDoor(unittest.TestCase):
         self.assertNotIn("secret-name", said)
         self.assertNotIn("no-such-folder", said)
         self.assertNotIn(ADMIN, said)
+
+    def test_a_log_nobody_is_reading_does_not_stop_the_door(self):
+        # Seen on a NAS: a bulk copy sat at one percentage all night. Whatever
+        # collects a container's log can stop reading it, and a line written
+        # straight to it then waits for ever, with a thread of the door behind
+        # every such line. The door must go on answering, and say afterwards
+        # how much it could not write.
+        stuck = threading.Event()
+
+        class Unread:
+            def write(self, text):
+                stuck.wait(60)
+                return len(text)
+
+            def flush(self):
+                pass
+
+        # Held on to for the whole test: print() does not keep its own hold on
+        # the log it is writing to, and one taken away under it crashes Python.
+        unread = Unread()
+        real, kept = sys.stdout, dav._log_lines.maxsize
+        sys.stdout, config.DAV_LOG, dav._log_lines.maxsize = unread, True, 5
+        said = io.StringIO()
+        try:
+            started = time.time()
+            for _ in range(40):
+                self.assertEqual(self.ask("PROPFIND", "/Visible/", headers={"Depth": "0"}, timeout=5)[0], 207)
+            self.assertLess(time.time() - started, 15)
+        finally:
+            config.DAV_LOG, dav._log_lines.maxsize = False, kept
+            sys.stdout = said
+            stuck.set()
+            dav._say("the log is being read again")
+            dav._log_lines.join()
+            sys.stdout = real
+        self.assertRegex(said.getvalue(), r"import door: \d+ lines were not written: the log was not being read")
+        self.assertIn("the log is being read again", said.getvalue())
+
+    def test_a_file_is_on_the_disk_before_it_has_its_name(self):
+        # Told 201, the client believes the file is safe. Without this a power
+        # cut seconds later could leave the name on an empty or shortened file.
+        seen, real = [], os.fsync
+        folder = os.path.join(config.MEDIA_DIR, "Visible")
+
+        def spy(fd):
+            seen.append([n for n in os.listdir(folder) if "synced" in n])
+            return real(fd)
+
+        os.fsync = spy
+        try:
+            self.assertEqual(self.ask("PUT", "/Visible/synced.jpg", body=self.bytes)[0], 201)
+        finally:
+            os.fsync = real
+        self.assertTrue(seen and seen[0], "it was written to the disk")
+        self.assertTrue(all(n.startswith(".synced.jpg.part-") for names in seen for n in names),
+                        "while it still had its hidden name")
+        self.assertEqual(self.ask("DELETE", "/Visible/synced.jpg")[0], 204)
 
     def test_a_client_that_goes_away_leaves_one_line_and_no_half_file(self):
         lines, real = [], dav._say

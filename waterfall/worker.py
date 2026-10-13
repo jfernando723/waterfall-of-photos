@@ -32,8 +32,15 @@ class Worker:
         self._lock = threading.Lock()
         self._soon: threading.Timer | None = None
         self._last_gc = time.time()     # first sweep a day after starting
+        # Every finished item's copies are looked at once when Waterfall
+        # starts, which is when a power cut would have done its damage, and
+        # again whenever the admin presses "Look for new files now".
+        self._check = True
+        # A check made while things are still waiting to be converted says
+        # nothing about those, so it is made once more when the queue empties.
+        self._check_when_idle = False
         self.state = {"phase": "starting", "current": None, "fraction": 0.0,
-                      "last_scan": None, "last_scan_at": None,
+                      "last_scan": None, "last_scan_at": None, "checked": None,
                       "video_seconds_done": 0.0, "video_wall_seconds": 0.0,
                       "video_bytes_done": 0, "photos_done": 0, "photo_wall_seconds": 0.0}
 
@@ -47,9 +54,10 @@ class Worker:
         self._stop.set()
         self._wake.set()
 
-    def rescan_now(self) -> None:
+    def rescan_now(self, check: bool = False) -> None:
         with self._lock:
             self.state["last_scan_at"] = None
+            self._check = self._check or check
         self._wake.set()
 
     def rescan_soon(self, delay: float = 30.0) -> None:
@@ -110,12 +118,21 @@ class Worker:
                           last_scan={"error": f"{config.MEDIA_DIR} does not exist"})
             else:
                 self._set(last_scan=library.scan(), last_scan_at=time.time())
+                with self._lock:
+                    check, self._check = self._check, False
+                if check:
+                    self._check_when_idle = bool(library.pending(limit=1))
+                    self._verify()
                 if time.time() - self._last_gc > 86400:
                     self._last_gc = time.time()
                     library.collect_garbage()
                     library.sweep_partials()
 
         todo = library.pending()
+        if not todo and self._check_when_idle:
+            self._check_when_idle = False
+            self._verify(again=True)
+            return                      # whatever it found damaged is waiting now
         if not todo:
             self._set(phase="idle", current=None, fraction=0.0)
             self._wake.wait(RESCAN_EVERY)
@@ -127,6 +144,17 @@ class Worker:
             self._photos(photos)
             return
         self._video(todo[0])
+
+    def _verify(self, again: bool = False) -> None:
+        """Check every finished item and keep what was found for the admin
+        page. `again` is the second look, made once the queue has emptied: what
+        the first look found damaged is carried over, so that mending it or
+        listing it as failed does not make it vanish from the count."""
+        self._set(phase="checking", current=None, fraction=0.0)
+        found = library.verify(lambda done: self._set(fraction=done))
+        earlier = (self.state["checked"] or {}).get("damaged", 0) if again else 0
+        self._set(checked={"whole": found["items"] - found["damaged"],
+                           "damaged": found["damaged"] + earlier, "at": found["at"]})
 
     def _photos(self, rows) -> None:
         self._set(phase="photos", current=f"{len(rows)} photos", fraction=0.0)

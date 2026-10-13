@@ -1040,7 +1040,7 @@
     sheet.style.transform = '';
     sheet.hidden = false;
     $('backdrop').hidden = false;
-    if (!wasOpen) { sheet.scrollTop = 0; pushHistory(); }
+    if (!wasOpen) { sheet.scrollTop = 0; holdPage(true); pushHistory(); }
   }
   function closeSheet() {
     clearInterval(sheetTimer);
@@ -1048,8 +1048,33 @@
     sheet.style.transition = '';
     sheet.style.transform = '';
     $('backdrop').hidden = true;
+    holdPage(false);
+  }
+  // With a mouse or a trackpad the page behind a sheet is held still (app.css
+  // says why). Where scrollbars take up room, holding the page takes its
+  // scrollbar away, so that room is given back as padding and the wall behind
+  // does not shift sideways.
+  function holdPage(on) {
+    const body = document.body;
+    const root = document.documentElement;
+    if (!on) { body.classList.remove('sheet-open'); body.style.paddingRight = ''; return; }
+    const before = root.clientWidth;
+    body.classList.add('sheet-open');
+    const gained = root.clientWidth - before;
+    if (gained > 0) body.style.paddingRight = gained + 'px';
   }
   $('backdrop').addEventListener('click', () => history.back());
+  // Beside a sheet, with the page held, there is nothing else to scroll, so
+  // two fingers on a trackpad there, or a mouse wheel, move the sheet too:
+  // nobody has to aim. It only listens. Refusing the event (preventDefault)
+  // is not needed with the page held, and in Firefox it left later swipes
+  // over the sheet itself doing nothing.
+  const pageIsHeld = window.matchMedia('(hover: hover) and (pointer: fine)');   // as in app.css
+  $('backdrop').addEventListener('wheel', (event) => {
+    if (event.ctrlKey || !pageIsHeld.matches) return;            // ctrl: a pinch, the browser's zoom
+    const by = event.deltaY;                                     // read first, so Firefox counts in pixels
+    sheet.scrollTop += event.deltaMode === 1 ? by * 20 : by;
+  }, { passive: true });
 
   // Drag a sheet down to close it. The handle always starts a drag; anywhere
   // else does too, but only when the sheet is scrolled to its top, so that
@@ -1346,8 +1371,10 @@
     });
   }
 
-  // The admin password, asked for here and nowhere else. Getting it right also
-  // opens the Hidden wall.
+  // The admin password, asked for here and nowhere else. Getting it right
+  // changes this menu and nothing else: the wall stays the Visible one until
+  // the Wall switch in the menu is used. Somebody signing in to add pictures
+  // to the Visible wall is not shown the Hidden one for it.
   function unlockForm(body) {
     const form = el('form');
     const input = el('input');
@@ -1366,7 +1393,7 @@
         const result = await api('/api/login', { password: input.value });
         await refreshMe();
         if (result.role !== 'admin') { note.textContent = 'That is not the admin password.'; return; }
-        await setRealm('hidden');
+        openSettings();
       } catch (error) {
         note.textContent = error.message;
       } finally {
@@ -1399,7 +1426,8 @@
     refresh();
     sheetTimer = setInterval(refresh, 3000);
     const rescan = el('button', 'plain', 'Look for new files now');
-    rescan.addEventListener('click', async () => { await api('/api/admin/rescan', {}); refresh(); });
+    // Pressed by a person, it also checks the small copies of everything finished.
+    rescan.addEventListener('click', async () => { await api('/api/admin/rescan', { check: true }); refresh(); });
     body.appendChild(rescan);
 
     body.appendChild(el('h3', '', 'Adding photos and videos'));
@@ -1424,9 +1452,10 @@
     let doing = 'Idle. Everything found has been converted.';
     if (w.phase === 'video' || w.phase === 'photos') doing = `Converting ${w.current}`;
     else if (w.phase === 'scanning') doing = 'Looking for new files';
+    else if (w.phase === 'checking') doing = 'Checking every small copy';
     else if (w.phase !== 'idle') doing = w.phase;
     target.appendChild(el('p', '', doing));
-    if (w.phase === 'video' || w.phase === 'photos') {
+    if (w.phase === 'video' || w.phase === 'photos' || w.phase === 'checking') {
       const meter = el('div', 'meter');
       meter.appendChild(el('i')).style.width = Math.round(w.fraction * 100) + '%';
       target.appendChild(meter);
@@ -1441,6 +1470,16 @@
         c.paired ? `${plural(c.paired, 'clip')} ${s.keeps_originals ? 'kept beside the photo' : 'waiting for the photo'}` : null]
         .filter(Boolean).join(' · ') : null],
       ['Failed', c.failed || null],
+      // What the last check of the finished items found, and what is in the
+      // folders without being an item: the two things "idle" cannot say.
+      ['Checked', w.checked ? `${plural(w.checked.whole, 'item')} whole`
+        + (w.checked.damaged ? `, ${w.checked.damaged} damaged` : '')
+        + ' · ' + new Date(w.checked.at * 1000).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : null],
+      ['Left alone', w.last_scan ? [
+        w.last_scan.partial ? `${plural(w.last_scan.partial, 'file')} that never finished arriving` : null,
+        w.last_scan.empty ? plural(w.last_scan.empty, 'empty file') : null,
+        w.last_scan.other ? `${plural(w.last_scan.other, 'file')} not a photo or video` : null,
+      ].filter(Boolean).join(' · ') || null : null],
       ['Space', s.storage ? `${fmtBytes(s.storage.copies)} of small copies`
         + (s.storage.awaiting ? ` · ${fmtBytes(s.storage.awaiting)} full-size still to convert` : '')
         + ` · ${fmtBytes(s.storage.free)} free` : null],
@@ -1488,7 +1527,8 @@
   const UP_SMALLEST = 256 * 1024;
   const up = { piece: 4 * 1024 * 1024, jobs: [], next: 0, active: 0, done: 0, skipped: 0, failed: [],
                bytes: 0, sent: 0, running: false, stopped: false, waiting: false, ticket: null,
-               rate: 0, rateAt: 0, rateSent: 0, where: '', note: '', realm: null, section: '',
+               rate: 0, rateAt: 0, rateSent: 0, where: '', note: '', why: '', realm: null, section: '',
+               flying: new Set(), waits: new Set(), plain: false,
                view: null, drawTimer: 0, shownDone: false };
 
   function upReset() {
@@ -1581,15 +1621,26 @@
     return new Promise((resolve) => {
       const done = () => {
         clearTimeout(timer);
+        up.waits.delete(done);
         window.removeEventListener('online', done);
         document.removeEventListener('visibilitychange', seen);
         resolve();
       };
+      up.waits.add(done);
       const seen = () => { if (!document.hidden) done(); };
       const timer = setTimeout(done, ms);
       window.addEventListener('online', done);
       document.addEventListener('visibilitychange', seen);
     });
+  }
+
+  // Stop means now. A piece on its way is dropped and a wait is ended, so the
+  // page says "Stopped" at once instead of when the piece in hand gives up.
+  function upStop() {
+    up.stopped = true;
+    for (const going of [...up.flying]) going.abort();
+    for (const wake of [...up.waits]) wake();
+    upDraw();
   }
 
   // One piece. A link that drops it is waited for and tried again for as long
@@ -1618,6 +1669,15 @@
         throw new Error(answer.data.error || `Refused (${answer.status}).`);
       }
       if (up.stopped) throw new Error('Stopped.');
+      // Every byte of the piece left and no answer came back. Seen from Safari
+      // on a Mac: the server had taken each piece and said so, and the page
+      // was never told. The other way of sending is used from here on.
+      if (answer.unanswered) up.plain = true;
+      // Three different troubles, and the page should not call them all "the
+      // connection": this device is offline; a piece went and no answer came
+      // back; or Waterfall answered and the answer was an error of its own.
+      up.why = answer.status ? (answer.data.error || `error ${answer.status}`)
+        : navigator.onLine === false ? 'offline' : '';
       up.waiting = true;
       upDraw();
       await upWait(wait);
@@ -1626,34 +1686,67 @@
     }
   }
 
+  const upHeaders = (job, offset, total) => {
+    const headers = { 'X-Waterfall': '1', 'Content-Type': 'application/octet-stream',
+                      'X-Upload-Path': encodeURIComponent(job.path), 'X-Upload-Id': job.id,
+                      'X-Upload-Offset': String(offset), 'X-Upload-Total': String(total),
+                      'X-Upload-Modified': String(Math.round((job.file.lastModified || 0) / 1000)) };
+    if (up.ticket) headers['X-Upload-Ticket'] = up.ticket;
+    return headers;
+  };
+
   // The request itself. Not fetch(): only this older interface says how much
   // of a body has left, and that is the number a person watching needs.
   function upRequest(job, offset, size, total) {
+    if (up.plain) return upRequestPlain(job, offset, size, total);
     return new Promise((resolve) => {
       const xhr = new XMLHttpRequest();
       let stalled = 0;
-      const quiet = () => {
+      let allLeft = false;          // every byte of this piece has gone: the answer is due
+      let unanswered = false;
+      const quiet = (ms) => {
         clearTimeout(stalled);
-        stalled = setTimeout(() => xhr.abort(), 45000);      // nothing has moved: start the piece again
+        stalled = setTimeout(() => { unanswered = allLeft; xhr.abort(); }, ms);    // start the piece again
       };
-      const finish = (status, data) => { clearTimeout(stalled); resolve({ status, data: data || {} }); };
+      const finish = (status, data) => {
+        clearTimeout(stalled);
+        up.flying.delete(xhr);
+        resolve({ status, data: data || {}, unanswered: !status && unanswered });
+      };
       xhr.open('POST', '/api/admin/upload?realm=' + job.realm);
       xhr.withCredentials = true;
       xhr.responseType = 'json';
-      xhr.setRequestHeader('X-Waterfall', '1');
-      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-      xhr.setRequestHeader('X-Upload-Path', encodeURIComponent(job.path));
-      xhr.setRequestHeader('X-Upload-Id', job.id);
-      xhr.setRequestHeader('X-Upload-Offset', String(offset));
-      xhr.setRequestHeader('X-Upload-Total', String(total));
-      xhr.setRequestHeader('X-Upload-Modified', String(Math.round((job.file.lastModified || 0) / 1000)));
-      if (up.ticket) xhr.setRequestHeader('X-Upload-Ticket', up.ticket);
-      xhr.upload.onprogress = (event) => { job.live = Math.min(size, event.loaded); quiet(); upDraw(); };
+      for (const [name, value] of Object.entries(upHeaders(job, offset, total))) xhr.setRequestHeader(name, value);
+      // Nothing moving for 45 seconds, or half a minute with no answer to a
+      // piece that has wholly gone, and the piece is given up.
+      xhr.upload.onprogress = (event) => { job.live = Math.min(size, event.loaded); if (!allLeft) quiet(45000); upDraw(); };
+      xhr.upload.onload = () => { allLeft = true; quiet(30000); };
       xhr.onload = () => finish(xhr.status, xhr.response);
       xhr.onerror = xhr.onabort = xhr.ontimeout = () => finish(0);
-      quiet();
+      quiet(45000);
+      up.flying.add(xhr);
       xhr.send(job.file.slice(offset, offset + size));
     });
+  }
+
+  // The same piece sent the plain way, as the first version of this did. It
+  // cannot say how much has left, so the numbers move a piece at a time; it is
+  // used only once the way above has gone unanswered.
+  async function upRequestPlain(job, offset, size, total) {
+    const going = new AbortController();
+    const patience = setTimeout(() => going.abort(), 120000);
+    up.flying.add(going);
+    try {
+      const response = await fetch('/api/admin/upload?realm=' + job.realm, {
+        method: 'POST', credentials: 'same-origin', headers: upHeaders(job, offset, total),
+        body: job.file.slice(offset, offset + size), signal: going.signal });
+      return { status: response.status, data: await response.json().catch(() => ({})) };
+    } catch {
+      return { status: 0, data: {} };
+    } finally {
+      clearTimeout(patience);
+      up.flying.delete(going);
+    }
   }
 
   // Everything the two displays need: how far, how fast, how long.
@@ -1670,8 +1763,8 @@
     const percent = up.bytes ? Math.min(100, Math.floor(sent / up.bytes * 100)) : 100;
     const left = up.rate > 1000 && up.bytes > sent ? (up.bytes - sent) / up.rate : 0;
     const finished = up.done + up.failed.length;
-    const state = up.running ? (up.waiting ? 'waiting' : 'sending')
-      : up.stopped ? 'stopped' : up.failed.length ? 'failed' : 'done';
+    const state = up.stopped ? 'stopped' : up.running ? (up.waiting ? 'waiting' : 'sending')
+      : up.failed.length ? 'failed' : 'done';
     return { sent, percent, left, finished, state, count: up.jobs.length };
   }
   const fmtLeft = (seconds) => seconds < 90 ? `${Math.max(1, Math.round(seconds))} s left`
@@ -1692,7 +1785,9 @@
         const head = el('div', 'up-head');
         head.append(el('b', '', u.state === 'done' ? 'Done' : u.percent + '%'),
           el('span', 'muted small', { sending: 'Uploading. Keep this page open.',
-            waiting: 'Waiting for the connection. It carries on by itself.', stopped: 'Stopped.',
+            waiting: (up.why === 'offline' ? 'Waiting for the connection.'
+              : up.why ? `Waterfall answered: ${up.why}.` : 'No answer came back.') + ' It tries again by itself.',
+            stopped: 'Stopped.',
             failed: 'Finished, but not everything went.', done: 'It appears on the wall as it is converted.' }[u.state]));
         const meter = el('div', 'meter' + (u.state === 'sending' ? ' busy' : ''));
         meter.appendChild(el('i')).style.width = u.percent + '%';
@@ -1706,11 +1801,11 @@
       if (up.note) view.appendChild(el('p', 'muted small', up.note));
       for (const f of up.failed.slice(0, 12)) view.appendChild(el('p', 'fail', `${f.job.file.name}: ${f.why}`));
       if (up.failed.length > 12) view.appendChild(el('p', 'fail', `and ${up.failed.length - 12} more`));
-      if (up.running) {
+      if (up.running && !up.stopped) {
         const stop = el('button', 'plain danger', 'Stop');
-        stop.addEventListener('click', () => { up.stopped = true; upDraw(); });
+        stop.addEventListener('click', upStop);
         view.appendChild(stop);
-      } else if (up.failed.length) {
+      } else if (!up.running && up.failed.length) {
         const again = el('button', 'plain', 'Send the failed ones again');
         again.addEventListener('click', async () => {
           const jobs = up.failed.map((f) => Object.assign(f.job, { sent: 0, live: 0 }));
@@ -1742,7 +1837,7 @@
     $('upload-pill-fill').style.width = (u.state === 'done' ? 100 : u.percent) + '%';
     $('upload-pill-text').textContent = {
       sending: `Uploading ${u.percent}%` + (u.left ? ` · ${fmtLeft(u.left)}` : ''),
-      waiting: `Upload waiting for the connection · ${u.percent}%`,
+      waiting: `Upload waiting · ${u.percent}%`,
       stopped: `Upload stopped at ${u.percent}%`,
       failed: `Upload: ${plural(up.failed.length, 'file')} did not go`,
       done: `Upload done · ${plural(up.done, 'file')}` }[u.state];

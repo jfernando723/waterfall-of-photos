@@ -31,6 +31,12 @@ Two things here are easy to get wrong and are deliberate:
     a file that was only moved, including between the two roots, finds them
     again at once. Converting 4K video is the expensive thing in this system;
     a move must never cost a second conversion.
+  * A power cut must not be able to cost an item. A file the system has been
+    handed is not on the disk until some seconds later, so before a full-size
+    file is removed its small copies are put on the disk by name (fsync), and
+    a record of small copies is never believed without looking at them:
+    convert() checks, and verify() goes through every finished item when
+    Waterfall starts and when the admin asks.
   * The index can be thrown away. Every finished item leaves a `done.json`
     beside its small copies, and a rescan rebuilds the database from those
     without converting anything again. Tags are hand-made and cannot be
@@ -177,6 +183,10 @@ def scan() -> dict:
     root = config.MEDIA_DIR
     seen: set[str] = set()
     added = changed = 0
+    # What is in the folders and is not an item, so that the admin page can
+    # say so: a name with nothing in it, a file that stopped half-way in, and
+    # anything that is not a photo or a video.
+    empty = partial = other = 0
     known = {r["rel_path"]: r for r in con.execute(
         "SELECT id, rel_path, size, mtime, status, trashed FROM items")}
     now = time.time()
@@ -192,6 +202,7 @@ def scan() -> dict:
             rel_folder = os.path.relpath(folder, root).replace(os.sep, "/")
             section = None
             present = {f for f in files if not f.startswith(".")}
+            partial += sum(1 for f in files if f.startswith(".") and ".part-" in f)
             # A stand-in is named for the file it replaced, so both are looked
             # up under that one name: the item is the same item either way.
             names = {f[:-len(config.STUB)] if f.endswith(config.STUB) else f for f in present}
@@ -207,6 +218,11 @@ def scan() -> dict:
                         here = False
                 kind = _kind(filename) if here else (stub or {}).get("kind")
                 if kind not in ("photo", "video"):
+                    if filename in present:
+                        if _kind(filename) and not here:
+                            empty += 1
+                        else:
+                            other += 1
                     continue
                 rel = f"{rel_folder}/{filename}"
                 seen.add(rel)
@@ -255,7 +271,8 @@ def scan() -> dict:
                 con.execute("DELETE FROM sections WHERE id=?", (row["id"],))
         for path in sorted(keep):
             _section_id(con, path)
-    return {"added": added, "changed": changed, "removed": len(gone), "total": len(seen)}
+    return {"added": added, "changed": changed, "removed": len(gone), "total": len(seen),
+            "empty": empty, "partial": partial, "other": other}
 
 
 GRACE = 7 * 86400
@@ -344,28 +361,38 @@ def _KEY_OK(key) -> bool:
     return isinstance(key, str) and len(key) == 24 and all(c in "0123456789abcdef" for c in key)
 
 
+def _expected(done: dict) -> dict | None:
+    """The small copies a record says there are: name -> size, or None for a
+    file whose size was not written down. None if the record itself is not one
+    this version could have made."""
+    if not done or done.get("pipeline") != PIPELINE:
+        return None
+    expect = {f"{name}.webp": size for name, size in (done.get("sizes") or {}).items() if name in "tml"}
+    if done.get("kind") == "photo":
+        if set(expect) != {"t.webp", "m.webp", "l.webp"}:
+            return None
+        if done.get("live"):
+            expect["live.mp4"] = (done.get("sizes") or {}).get("live")
+    else:
+        if not {"t.webp", "m.webp"} <= set(expect) or not done.get("rungs") or not done.get("duration"):
+            return None
+        expect["p.mp4"] = (done.get("sizes") or {}).get("p")
+        for rung in done["rungs"]:
+            expect[f"v/{rung['name']}.m4s"] = rung["bytes"]
+            expect[f"v/{rung['name']}.m3u8"] = None
+    return expect
+
+
 def copies_complete(key: str, done: dict) -> bool:
     """Every small copy that should exist does, at the size it was made.
 
     This is the check that stands between a finished conversion and removing
     the full-size file. It is deliberately literal: the files, on disk, now.
     """
-    if not done or done.get("pipeline") != PIPELINE:
+    expect = _expected(done)
+    if expect is None:
         return False
     folder = media.deriv_dir(key)
-    expect = {f"{name}.webp": size for name, size in (done.get("sizes") or {}).items() if name in "tml"}
-    if done.get("kind") == "photo":
-        if set(expect) != {"t.webp", "m.webp", "l.webp"}:
-            return False
-        if done.get("live"):
-            expect["live.mp4"] = (done.get("sizes") or {}).get("live")
-    else:
-        if not {"t.webp", "m.webp"} <= set(expect) or not done.get("rungs") or not done.get("duration"):
-            return False
-        expect["p.mp4"] = (done.get("sizes") or {}).get("p")
-        for rung in done["rungs"]:
-            expect[f"v/{rung['name']}.m4s"] = rung["bytes"]
-            expect[f"v/{rung['name']}.m3u8"] = None
     for name, size in expect.items():
         try:
             actual = os.path.getsize(os.path.join(folder, name))
@@ -374,6 +401,65 @@ def copies_complete(key: str, done: dict) -> bool:
         if actual <= 0 or (size is not None and actual != size):
             return False
     return True
+
+
+def _to_disk(path: str) -> None:
+    """Have a file, or a folder's list of names, written to the disk now
+    instead of in the system's own time."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def copies_to_disk(key: str, done: dict) -> None:
+    """Put an item's small copies, the record of them and the folders they are
+    named in on the disk. Raises OSError if a copy cannot be.
+
+    What a program writes sits in memory for up to half a minute before the
+    system puts it on the disk. Removing a full-size file inside that half
+    minute, and losing power inside it too, would leave the item with a
+    stand-in and nothing behind it. So the copies go first, and are known to
+    have gone, before anything is removed."""
+    folder = media.deriv_dir(key)
+    names = list(_expected(done) or {}) + ["done.json"]
+    for name in names:
+        _to_disk(os.path.join(folder, name))
+    for where in sorted({os.path.dirname(os.path.join(folder, n)) for n in names}
+                        | {os.path.dirname(folder), config.DERIV_DIR}):
+        try:
+            _to_disk(where)
+        except OSError:
+            pass                # not every filesystem will do this for a folder; the files are what matter
+
+
+def verify(progress=None) -> dict:
+    """Look at the small copies of every finished item and send back through
+    convert() any whose copies are not all there at the size they were made.
+
+    Nothing else ever looks again at an item once it is finished, so without
+    this a copy damaged by a power cut would stay on the wall as a broken
+    picture and the admin page would go on saying all is well. An item sent
+    back is made again if its full-size file is still here; if it is not, it is
+    listed as failed with the words "Import it again", which is the truth.
+    Reads only, apart from marking what it finds."""
+    con = connect()
+    rows = con.execute("SELECT id, key, kind FROM items WHERE status='ready'").fetchall()
+    whole: dict[tuple, bool] = {}
+    damaged = []
+    for n, row in enumerate(rows, 1):
+        which = (row["key"], row["kind"])
+        if which not in whole:
+            whole[which] = bool(row["key"]) and _load_done(row["key"], row["kind"]) is not None
+        if not whole[which]:
+            damaged.append((row["id"],))
+        if progress and n % 25 == 0:
+            progress(n / len(rows))
+    if damaged:
+        with con:
+            con.executemany("UPDATE items SET status='new', attempts=0, error=NULL WHERE id=?", damaged)
+    return {"items": len(rows), "damaged": len(damaged), "at": time.time()}
 
 
 def trash_original(row, key: str, done: dict) -> bool:
@@ -388,6 +474,10 @@ def trash_original(row, key: str, done: dict) -> bool:
         return False
     full = os.path.join(config.MEDIA_DIR, row["rel_path"])
     if not os.path.isfile(full) or not copies_complete(key, done):
+        return False
+    try:
+        copies_to_disk(key, done)
+    except OSError:
         return False
     when = time.strftime("%Y-%m-%d")
     size = os.path.getsize(full)
@@ -409,6 +499,10 @@ def trash_original(row, key: str, done: dict) -> bool:
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp, full + config.STUB)
+        try:
+            _to_disk(folder)        # the stand-in's name, before the file it stands in for goes
+        except OSError:
+            pass
         os.remove(full)
     except OSError:
         try:
@@ -437,7 +531,9 @@ def _load_done(key: str, kind: str) -> dict | None:
         return None
     if done.get("pipeline") != PIPELINE or done.get("kind") != kind:
         return None
-    return done
+    # The record is written last and is small, so it can survive a power cut
+    # that the copies it describes did not. Believed only with the copies.
+    return done if copies_complete(key, done) else None
 
 
 def _upgrade_done(key: str, kind: str, have_original: bool) -> dict | None:
@@ -477,6 +573,8 @@ def _upgrade_done(key: str, kind: str, have_original: bool) -> dict | None:
             done.setdefault("sizes", {})["p"] = media._preview(
                 smallest, os.path.join(folder, "p.mp4"), done["duration"])
     done["pipeline"] = PIPELINE
+    if not copies_complete(key, done):
+        return None             # an old record whose copies are not all there: start again
     tmp = _done_path(key) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(done, f)
@@ -561,6 +659,7 @@ def _keep_motion(con, row, key: str, twin, full: str, meta: dict) -> str:
                     (info, copy_bytes, twin["key"]))
     if not config.KEEP_ORIGINALS:
         try:
+            copies_to_disk(twin["key"], done)
             os.remove(full)
             with con:
                 con.execute("DELETE FROM items WHERE id=?", (row["id"],))
@@ -590,10 +689,13 @@ def convert(row, meta: dict | None = None, progress=None) -> str:
         if gone:
             # A stand-in: the full-size file was removed after an earlier
             # conversion. Its copies must already exist; they cannot be remade.
-            key = row["key"]
+            # The stand-in says which copies are its own. The index says so
+            # too, but it is the less durable of the two: after a power cut it
+            # can be half a minute behind what is in the folders.
+            key = row["key"] or (read_stub(full + config.STUB) or {}).get("key")
             done = (_load_done(key, row["kind"]) or _upgrade_done(key, row["kind"], False)) if key else None
             if done is None:
-                raise media.MediaError("Its small copies are missing or out of date and the "
+                raise media.MediaError("Its small copies are missing, damaged or out of date and the "
                                        "full-size file is no longer here. Import it again.")
         else:
             key = media.fingerprint(full)

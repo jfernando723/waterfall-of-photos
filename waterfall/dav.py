@@ -32,6 +32,7 @@ import base64
 import collections
 import mimetypes
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -65,11 +66,49 @@ ALLOW = "OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, LOCK, UNL
 _on_change = lambda: None       # set by serve(): "something arrived, look again soon"
 
 
+# The log is written by one thread of its own, from a queue that has an end.
+# Whatever collects a container's log can fall behind or stop, and a line
+# written straight to a log nobody is reading waits for ever. With every one of
+# the door's threads waiting there the door stops answering, the file manager
+# sits at the same percentage all night, and nothing anywhere says why. So the
+# door never waits for its own log: a line that will not fit is dropped and
+# counted, and the count is written when the log moves again.
+LOG_KEPT = 2000
+_log_lines: queue.Queue = queue.Queue(maxsize=LOG_KEPT)
+_log_lost = 0
+_log_writer: threading.Thread | None = None
+_log_start = threading.Lock()
+
+
+def _write_log() -> None:
+    global _log_lost
+    while True:
+        line = _log_lines.get()
+        lost, _log_lost = _log_lost, 0
+        try:
+            if lost:
+                print(f"import door: {lost} lines were not written: the log was not being read", flush=True)
+            print("import door: " + line, flush=True)
+        except (OSError, ValueError):
+            pass                    # a log that has gone away is not the door's problem either
+        finally:
+            _log_lines.task_done()
+
+
 def _say(line: str) -> None:
     """One line in the log, which on a NAS is the only place to look when a
     file manager will not copy something in. Never a file or folder name: the
-    log is not behind the admin password."""
-    print("import door: " + line, flush=True)
+    log is not behind the admin password. Never waits."""
+    global _log_writer, _log_lost
+    if _log_writer is None:
+        with _log_start:
+            if _log_writer is None:
+                _log_writer = threading.Thread(target=_write_log, name="waterfall-import-log", daemon=True)
+                _log_writer.start()
+    try:
+        _log_lines.put_nowait(line)
+    except queue.Full:
+        _log_lost += 1
 
 
 def _plain(text: str, most: int) -> str:
@@ -468,6 +507,11 @@ class Handler(BaseHTTPRequestHandler):
                     for piece in self._body():
                         f.write(piece)
                         got += len(piece)
+                    # On the disk before it has its name. Without this a power
+                    # cut in the next half-minute can leave the name on a file
+                    # that is empty or cut short, and the client was told 201.
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(temp, path)
             except BaseException:
                 self._why = f"{got} of {expected} bytes had arrived" if expected else f"{got} bytes had arrived"
