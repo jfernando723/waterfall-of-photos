@@ -38,6 +38,7 @@ No other machine has been considered.
 | | |
 |---|---|
 | Opening it | The address shows the **Visible** wall at once. No sign-in, no username. |
+| Its icon | In a browser's tabs and new-tab page, and on a phone's or tablet's home screen: in Safari on an iPhone or iPad, **Share → Add to Home Screen** gives a Waterfall icon that opens the wall full screen. Drawn by `scripts/make-icons.py`. |
 | Admin | The **···** menu asks for the admin password. That opens the admin menu: the library status, adding pictures, and the switch to the **Hidden** wall. Signing in does not change the wall; the Hidden one is shown only when that switch is used. Left untouched for half an hour, the page signs the admin out by itself and goes back to the Visible wall. |
 | The wall | Every photo and video as a grid that never ends. Shuffle, Newest or Oldest; All, Photos or Videos. Video tiles play a few silent seconds. |
 | Sections | Each folder is a section; a folder inside a folder is a sub-section. |
@@ -109,7 +110,7 @@ is made.
 ```
 git clone https://github.com/jfernando723/waterfall-of-photos.git
 cd waterfall-of-photos
-docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.6.3 .
+docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.6.4 .
 docker compose up -d
 ```
 

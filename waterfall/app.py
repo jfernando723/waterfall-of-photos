@@ -135,12 +135,40 @@ def index():
     return response
 
 
+# Waterfall's icon (drawn by scripts/make-icons.py): in a browser's tab, on its
+# new-tab page, and on an iPhone's or iPad's Home Screen. Browsers and phones
+# ask for these addresses by themselves, before or without reading the page,
+# so they answer to anyone: an icon says nothing about the library.
+ICONS = {"favicon.ico": "image/vnd.microsoft.icon",
+         "apple-touch-icon.png": "image/png", "apple-touch-icon-precomposed.png": "image/png"}
+ICON_DAY = 86400
+
+
 @app.get("/favicon.ico")
-def favicon():
-    """There is no icon. Saying so plainly keeps the one thing a browser asks
-    for unprompted out of its list of errors."""
-    response = make_response("", 204)
-    response.headers["Cache-Control"] = f"public, max-age={YEAR}"
+@app.get("/apple-touch-icon.png")
+@app.get("/apple-touch-icon-precomposed.png")
+def icon():
+    name = request.path.lstrip("/")
+    path = os.path.join(app.static_folder, "apple-touch-icon.png" if name.startswith("apple") else name)
+    response = send_file(path, mimetype=ICONS[name], max_age=ICON_DAY)
+    response.headers["Cache-Control"] = f"public, max-age={ICON_DAY}"
+    return response
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    """What a phone or Chrome needs to put Waterfall on a home screen or in a
+    list of apps: its name, its icon and its colours. Opened from there it fills
+    the screen, as on an iPhone (apple-mobile-web-app-capable in the page)."""
+    v = _asset_version()
+    body = {"name": "Waterfall", "short_name": "Waterfall", "start_url": "/", "scope": "/",
+            "display": "standalone", "background_color": "#0b0b0d", "theme_color": "#0b0b0d",
+            "icons": [{"src": f"/static/icon-192.png?v={v}", "sizes": "192x192", "type": "image/png"},
+                      {"src": f"/static/icon-512.png?v={v}", "sizes": "512x512", "type": "image/png"},
+                      {"src": f"/static/icon.svg?v={v}", "sizes": "any", "type": "image/svg+xml"}]}
+    response = make_response(json.dumps(body))
+    response.headers["Content-Type"] = "application/manifest+json"
+    response.headers["Cache-Control"] = "no-cache"
     return response
 
 

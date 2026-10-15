@@ -924,6 +924,50 @@ class TestHTTP(unittest.TestCase):
             self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         return c
 
+    def test_the_icon_is_there_for_tabs_and_home_screens_and_asks_for_no_password(self):
+        # Asked for: the icon in a browser's tabs and new-tab page, and on an
+        # iPhone's or iPad's Home Screen when the site is added there. Phones and
+        # browsers fetch these without the page's cookies, so they answer even
+        # behind a viewing password.
+        from PIL import Image
+        auth.set_passwords(None, "a viewing password")
+        try:
+            c = self.client()
+            self.assertEqual(c.get("/api/sections").status_code, 401, "the wall itself stays shut")
+            r = c.get("/favicon.ico")
+            self.assertEqual((r.status_code, r.mimetype), (200, "image/vnd.microsoft.icon"))
+            with Image.open(io.BytesIO(r.get_data())) as ico:
+                self.assertEqual(sorted(ico.info["sizes"]), [(16, 16), (32, 32), (48, 48)])
+            touch = c.get("/apple-touch-icon.png")
+            self.assertEqual(touch.get_data(), c.get("/apple-touch-icon-precomposed.png").get_data())
+            with Image.open(io.BytesIO(touch.get_data())) as png:
+                # A Home Screen icon fills its square: a phone paints anything
+                # see-through black, and cuts its own corners.
+                self.assertEqual((png.format, png.size, png.mode), ("PNG", (180, 180), "RGB"))
+            self.assertIn("public", touch.headers["Cache-Control"])
+            m = c.get("/manifest.webmanifest")
+            self.assertEqual((m.status_code, m.mimetype), (200, "application/manifest+json"))
+            found = json.loads(m.get_data())
+            self.assertEqual((found["name"], found["start_url"], found["display"]), ("Waterfall", "/", "standalone"))
+            for entry in found["icons"]:
+                got = c.get(entry["src"])
+                self.assertEqual(got.status_code, 200, entry["src"])
+                if entry["type"] == "image/png":
+                    with Image.open(io.BytesIO(got.get_data())) as png:
+                        self.assertEqual("%dx%d" % png.size, entry["sizes"])
+                else:
+                    drawing = ET.fromstring(got.get_data())
+                    self.assertTrue(drawing.tag.endswith("svg"))
+                    self.assertNotIn(b"<script", got.get_data())
+            page = c.get("/").get_data(as_text=True)
+            for line in ('<link rel="icon" href="/favicon.ico"', '<link rel="icon" href="/static/icon.svg',
+                         '<link rel="apple-touch-icon" href="/static/apple-touch-icon.png',
+                         '<link rel="manifest" href="/manifest.webmanifest">',
+                         '<meta name="apple-mobile-web-app-title" content="Waterfall">'):
+                self.assertIn(line, page)
+        finally:
+            auth.set_passwords(None, None, clear_viewer=True)
+
     def test_opening_the_address_shows_the_visible_wall_without_signing_in(self):
         c = self.client()
         me = c.get("/api/me").get_json()
