@@ -187,6 +187,7 @@ def scan() -> dict:
     # say so: a name with nothing in it, a file that stopped half-way in, and
     # anything that is not a photo or a video.
     empty = partial = other = 0
+    left: dict[tuple, None] = {}        # (where it is, why it was left), in the order met
     known = {r["rel_path"]: r for r in con.execute(
         "SELECT id, rel_path, size, mtime, status, trashed FROM items")}
     now = time.time()
@@ -202,7 +203,16 @@ def scan() -> dict:
             rel_folder = os.path.relpath(folder, root).replace(os.sep, "/")
             section = None
             present = {f for f in files if not f.startswith(".")}
-            partial += sum(1 for f in files if f.startswith(".") and ".part-" in f)
+            for f in files:
+                if not (f.startswith(".") and ".part-" in f):
+                    continue
+                try:        # one still growing is on its way in, not left behind
+                    if now - os.path.getmtime(os.path.join(folder, f)) < STILL_ARRIVING:
+                        continue
+                except OSError:
+                    continue
+                partial += 1
+                left[(f"{rel_folder}/{f[1:f.rindex('.part-')]}", "partial")] = None
             # A stand-in is named for the file it replaced, so both are looked
             # up under that one name: the item is the same item either way.
             names = {f[:-len(config.STUB)] if f.endswith(config.STUB) else f for f in present}
@@ -221,8 +231,10 @@ def scan() -> dict:
                     if filename in present:
                         if _kind(filename) and not here:
                             empty += 1
+                            left[(f"{rel_folder}/{filename}", "empty")] = None
                         else:
                             other += 1
+                            left[(f"{rel_folder}/{filename}", "other")] = None
                     continue
                 rel = f"{rel_folder}/{filename}"
                 seen.add(rel)
@@ -272,10 +284,13 @@ def scan() -> dict:
         for path in sorted(keep):
             _section_id(con, path)
     return {"added": added, "changed": changed, "removed": len(gone), "total": len(seen),
-            "empty": empty, "partial": partial, "other": other}
+            "empty": empty, "partial": partial, "other": other,
+            "left": [{"path": path, "why": why} for path, why in list(left)[:LEFT_LISTED]]}
 
 
 GRACE = 7 * 86400
+STILL_ARRIVING = 600        # seconds: a half-arrived file touched this recently is still on its way
+LEFT_LISTED = 40            # how many left-alone files the admin page is told about by name
 
 
 def collect_garbage(grace: float = GRACE) -> int:
@@ -670,13 +685,21 @@ def _keep_motion(con, row, key: str, twin, full: str, meta: dict) -> str:
 
 def _send_for_motion(con, row) -> None:
     """A still has just been converted. If its clip arrived first and has been
-    waiting, put the clip back in the queue so that it can now be filed."""
-    stem = os.path.splitext(row["rel_path"])[0]
-    where, params = _stem_match(stem)
-    with con:
-        con.execute("UPDATE items SET status='new', attempts=0, error=NULL "
-                    f"WHERE kind='video' AND status='paired' AND section_id=? AND {where}",
-                    [row["section_id"]] + params)
+    waiting, put the clip back in the queue so that it can now be filed.
+
+    The clip is looked for the way _live_twin looks for the still: the clip's
+    name, less its ending, begins the still's. So "IMG_0006.MOV" is sent for by
+    "IMG_0006.HEIC" and by "IMG_0006.HEIC_compressed.JPEG" alike. Matching on
+    the still's own name less its ending missed the second, and the clip then
+    waited for ever, unseen."""
+    still = row["rel_path"].lower()
+    waiting = [(r["id"],) for r in con.execute(
+        "SELECT id, rel_path FROM items WHERE kind='video' AND status='paired' AND section_id=? AND id<>?",
+        (row["section_id"], row["id"])).fetchall()
+        if still.startswith(os.path.splitext(r["rel_path"])[0].lower() + ".")]
+    if waiting:
+        with con:
+            con.executemany("UPDATE items SET status='new', attempts=0, error=NULL WHERE id=?", waiting)
 
 
 def convert(row, meta: dict | None = None, progress=None) -> str:

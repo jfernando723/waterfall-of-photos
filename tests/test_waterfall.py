@@ -1036,6 +1036,17 @@ class TestHTTP(unittest.TestCase):
         beside = js[start:js.index("{ passive: true });", start)]
         self.assertNotIn("preventDefault", beside,
                          "refusing a wheel event left Firefox ignoring every later swipe over the sheet")
+        # And after Unlock the admin's menu is opened afresh rather than grown
+        # out of the sign-in box in place: in one Firefox on the NAS the grown one
+        # would not scroll with two fingers until the page was reloaded.
+        unlock = js[js.index("function unlockForm(body)"):js.index("function adminPanel(body)")]
+        self.assertIn("openSettings(true);", unlock)
+        reopen = js[js.index("function reopenSheet(build)"):js.index("function closeSheet()")]
+        self.assertIn("closeSheet();", reopen)
+        self.assertIn("openSheet(build, true)", reopen, "afresh, without a second step in the history")
+        self.assertIn("if (!again) pushHistory();", js)
+        self.assertIn("$('open-settings').addEventListener('click', () => openSettings());", js,
+                      "the button must not hand its click to openSettings as 'again'")
 
     def test_signing_in_as_the_admin_leaves_the_visible_wall_showing(self):
         # Asked for outright: somebody who signs in to add pictures to the
@@ -1045,7 +1056,7 @@ class TestHTTP(unittest.TestCase):
         js = self.client().get("/static/app.js").get_data(as_text=True)
         unlock = js[js.index("function unlockForm(body)"):js.index("function adminPanel(body)")]
         self.assertNotIn("setRealm", unlock)
-        self.assertIn("openSettings()", unlock, "it shows the admin menu instead")
+        self.assertIn("openSettings(true)", unlock, "it shows the admin menu instead")
         self.assertEqual(js.count("setRealm('hidden')"), 0, "nothing chooses the Hidden wall but the switch")
 
     def test_the_admin_page_is_told_what_a_look_found_and_what_a_check_found(self):
@@ -1063,7 +1074,14 @@ class TestHTTP(unittest.TestCase):
             self.assertTrue(worker._check, "the button on the admin page")
         finally:
             worker._check = was
+        # The page is told which build the server would hand out now, and
+        # which one it is itself, so that one left open across an update can
+        # load itself again instead of running old code under a new number.
+        build = c.get("/api/me").get_json()["build"]
+        self.assertTrue(build.startswith(c.get("/api/me").get_json()["version"] + "-"))
+        self.assertIn(f'<body data-build="{build}">', c.get("/").get_data(as_text=True))
         js = c.get("/static/app.js").get_data(as_text=True)
+        self.assertIn("state.me.build === BUILD", js)
         self.assertIn("api('/api/admin/rescan', { check: true })", js)
         self.assertIn("No answer came back.", js, "an upload that hears nothing does not blame the connection")
 
@@ -1396,14 +1414,64 @@ class TestSmallCopiesOnly(unittest.TestCase):
         folder = os.path.join(config.MEDIA_DIR, "Visible", "Cut")
         before = library.scan()
         open(os.path.join(folder, "IMG_8040.jpg"), "wb").close()            # a name with nothing in it
-        with open(os.path.join(folder, ".IMG_8041.jpg.part-0a1b2c3d"), "wb") as f:
+        stopped = os.path.join(folder, ".IMG_8041.jpg.part-0a1b2c3d")
+        with open(stopped, "wb") as f:
             f.write(b"half")                                                # stopped half-way in
+        os.utime(stopped, (time.time() - 1200, time.time() - 1200))         # twenty minutes ago
+        with open(os.path.join(folder, ".IMG_8042.jpg.part-0a1b2c3d"), "wb") as f:
+            f.write(b"half")                                                # still on its way in
         with open(os.path.join(folder, "notes.txt"), "w") as f:
             f.write("not a picture")
         after = library.scan()
-        self.assertEqual([after[k] - before[k] for k in ("empty", "partial", "other", "total")], [1, 1, 1, 0])
-        for name in ("IMG_8040.jpg", ".IMG_8041.jpg.part-0a1b2c3d", "notes.txt"):
+        self.assertEqual([after[k] - before[k] for k in ("empty", "partial", "other", "total")], [1, 1, 1, 0],
+                         "one that is still arriving is not counted as left behind")
+        # And the admin page is told which, so that nobody has to go looking.
+        named = {(f["path"], f["why"]) for f in after["left"]}
+        self.assertLessEqual({("Visible/Cut/IMG_8040.jpg", "empty"), ("Visible/Cut/IMG_8041.jpg", "partial"),
+                              ("Visible/Cut/notes.txt", "other")}, named)
+        self.assertNotIn(("Visible/Cut/IMG_8042.jpg", "partial"), named)
+        for name in ("IMG_8040.jpg", ".IMG_8041.jpg.part-0a1b2c3d", ".IMG_8042.jpg.part-0a1b2c3d", "notes.txt"):
             os.remove(os.path.join(folder, name))
+
+    def test_9e_a_long_conversion_does_not_hold_up_a_look_at_the_folders_or_outlive_its_file(self):
+        # Seen on a NAS: everything was deleted through the import door, and
+        # the wall went on showing it, because the look that would have noticed
+        # waited for the video being converted, which had hours to go.
+        from waterfall.worker import Worker
+        w = Worker()
+        w._check = False
+        w._wake.set()
+        w._tick()
+        data, path, key = self._fresh("IMG_8050.jpg", "meanwhile")
+        stand_in = path + config.STUB
+        still_here = os.path.join(config.MEDIA_DIR, "Visible", "Trip", "IMG_8002.mp4" + config.STUB)
+        os.remove(stand_in)                                 # deleted through the door, mid-conversion
+        w.rescan_now()                                      # which asks for a look
+        w._meanwhile(still_here)                            # ... and the conversion's next second gives it one
+        self.assertIsNotNone(w.state["last_scan_at"])
+        self.assertIsNone(library.connect().execute("SELECT 1 FROM items WHERE name='IMG_8050.jpg'").fetchone(),
+                          "gone from the wall without waiting for the video to finish")
+        # The file being converted is itself removed: the work is stopped, and a look is asked for.
+        with self.assertRaises(media.MediaError):
+            w._meanwhile(os.path.join(config.MEDIA_DIR, "Visible", "Trip", "no-longer-here.mov"))
+        self.assertIsNone(w.state["last_scan_at"])
+        library.close()
+
+    def test_9f_what_an_abandoned_upload_left_is_cleared_as_it_starts(self):
+        # The daily sweep never came on a machine restarted more often than daily.
+        from waterfall.worker import Worker
+        folder = os.path.join(config.MEDIA_DIR, "Visible", "Cut")
+        old = os.path.join(folder, ".IMG_8060.jpg.part-0a1b2c3d")
+        with open(old, "wb") as f:
+            f.write(b"half")
+        os.utime(old, (time.time() - 2 * 86400, time.time() - 2 * 86400))
+        w = Worker()
+        w._check = False
+        w._wake.set()
+        w._tick()
+        self.assertFalse(os.path.exists(old))
+        self.assertEqual(w.state["last_scan"]["partial"], 0)
+        library.close()
 
     def test_9d_the_converter_checks_at_its_start_and_when_the_admin_asks(self):
         from waterfall.worker import Worker
@@ -1466,6 +1534,32 @@ class TestLivePhotos(unittest.TestCase):
         self.assertFalse(os.path.exists(clip))
         self.assertEqual(sorted(os.listdir(self.folder)), ["IMG_7001.JPG.waterfall.txt"])
         self.assertEqual(library.counts()["paired"], 0)
+
+    def test_a_waiting_clip_is_sent_for_by_a_still_whose_name_only_begins_with_its_own(self):
+        # Some exports name the still for the file it was made from:
+        # IMG_7004.HEIC_compressed.JPEG beside IMG_7004.MOV. The clip finds
+        # that still; the still has to find the clip the same way.
+        clip = fixtures.video(os.path.join(self.folder, "IMG_7004.MOV"), 640, 480, 2)
+        other = fixtures.video(os.path.join(self.folder, "IMG_700.MOV"), 640, 360, 3)
+        still = os.path.join(self.folder, "IMG_7004.HEIC_compressed.JPEG")
+        with open(still, "wb") as f:
+            f.write(b"not arrived properly")
+        convert_everything()
+        status = lambda name: library.connect().execute(
+            "SELECT status FROM items WHERE name=?", (name,)).fetchone()["status"]
+        self.assertEqual(status("IMG_7004.MOV"), "paired")
+        os.remove(still)
+        fixtures.photo(still, 1600, 1200, "late")
+        library.retry_failed()
+        convert_everything()
+        self.assertGreater(item_named("IMG_7004.HEIC_compressed.JPEG")["sizes"]["live"], 0)
+        self.assertFalse(os.path.exists(clip))
+        self.assertEqual(library.counts()["paired"], 0)
+        # A clip whose name is merely shorter is not this still's, and is a video as before.
+        self.assertFalse(os.path.exists(other))
+        self.assertEqual(item_named("IMG_700.MOV")["kind"], "video")
+        self.assertEqual(sorted(os.listdir(self.folder)),
+                         ["IMG_700.MOV.waterfall.txt", "IMG_7004.HEIC_compressed.JPEG.waterfall.txt"])
 
     def test_a_longer_video_with_a_photos_name_is_a_video(self):
         fixtures.photo(os.path.join(self.folder, "IMG_7002.jpg"), 1600, 1200, "still")
@@ -1631,19 +1725,48 @@ class TestUploads(unittest.TestCase):
         # A piece of an upload that really is unknown is still refused.
         self.assertEqual(self.send(c, "Lost%2Fc.jpg", b"x" * 10, 10, 30, upload_id="5" * 16).status_code, 409)
 
-    def test_stop_stops_at_once_and_an_unanswered_piece_changes_the_way_of_sending(self):
-        # No test here can click. These keep two cures from being undone: Stop
-        # used to wait for the piece in hand, which on a stalled upload was for
-        # ever as far as anyone watching could tell; and a piece that wholly
-        # left and was never answered is sent the plain way from then on.
+    def test_asked_to_close_after_answering_the_answer_gives_no_length(self):
+        # A page that was not hearing its answers asks for the connection to be
+        # closed after each one. The server ends an answer of no stated length
+        # by closing, so that is how it is given.
+        c = self.admin()
+        plain = self.send(c, "Close%2Fa.jpg", self.bytes, upload_id="6" * 16)
+        self.assertEqual((plain.status_code, plain.headers.get("Content-Length")), (200, str(len(plain.get_data()))))
+        closing = self.send(c, "Close%2Fb.jpg", self.bytes, upload_id="7" * 16, **{"X-Upload-Close": "1"})
+        self.assertEqual(closing.status_code, 200)
+        self.assertIsNone(closing.headers.get("Content-Length"))
+        self.assertEqual((closing.get_json()["done"], closing.get_json()["name"]), (True, "b.jpg"))
+        with open(self.where("Visible", "Close", "b.jpg"), "rb") as f:
+            self.assertEqual(f.read(), self.bytes)
+
+    def test_pieces_go_by_fetch_and_stop_stops_at_once(self):
+        # No test here can click. These keep three cures from being undone.
+        # (1) Every piece goes by fetch(). Safari on an iPhone never finished
+        # an XMLHttpRequest that carried a piece of 512 KB or more, over
+        # Tailscale or the home network, however the server answered: the
+        # answer arrived whole and the request stayed open (0 of 63).
+        # fetch() finished. The Mac's Safari showed the same signs to the NAS.
         js = self.app.test_client().get("/static/app.js").get_data(as_text=True)
+        self.assertNotIn("new XMLHttpRequest", js)
+        send = js[js.index("async function upRequest("):js.index("function upPatience(")]
+        self.assertIn("await fetch('/api/admin/upload?realm=' + job.realm", send)
+        self.assertIn("body: bytes", send, "a piece is sent from memory")
+        self.assertNotIn("job.file", send)
+        # (2) Stop used to wait for the piece in hand, which on a stalled
+        # upload was for ever as far as anyone watching could tell.
         stop = js[js.index("function upStop()"):js.index("// One piece.")]
         self.assertIn("going.abort()", stop)
         self.assertIn("wake()", stop)
+        self.assertIn("up.flying.add(going);", send)
         self.assertIn("stop.addEventListener('click', upStop)", js)
         self.assertIn("const state = up.stopped ? 'stopped'", js, "it says so at once")
-        self.assertIn("if (answer.unanswered) up.plain = true;", js)
-        self.assertIn("if (up.plain) return upRequestPlain(job, offset, size, total);", js)
+        # (3) A piece that goes unanswered makes the rest go more carefully:
+        # smaller pieces, the connection closed after each answer.
+        self.assertIn("if (answer.unanswered && up.care < UP_CARE.length - 1) {", js)
+        self.assertIn("if (up.care) headers['X-Upload-Close'] = '1';", send)
+        self.assertIn("const size = Math.min(piece, total - offset, UP_CARE[up.care]);", js)
+        # And an answer that does not say how much is held is no answer.
+        self.assertIn("if (answer.data.done || Number.isFinite(answer.data.have)) {", js)
 
     def test_only_photos_and_videos_and_only_inside_the_two_walls(self):
         c = self.admin()

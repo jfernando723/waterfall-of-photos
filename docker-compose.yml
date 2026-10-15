@@ -19,7 +19,7 @@
 
 services:
   waterfall:
-    image: ghcr.io/jfernando723/waterfall-of-photos:0.6.2
+    image: ghcr.io/jfernando723/waterfall-of-photos:0.6.3
     container_name: waterfall
     restart: unless-stopped
 

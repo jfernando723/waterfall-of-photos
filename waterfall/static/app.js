@@ -100,6 +100,17 @@
     if (!response.ok) throw new Error(data.error || `Something went wrong (${response.status}).`);
     return data;
   }
+  // A page left open while Waterfall is updated goes on running the code it
+  // was given, against a server that has moved on, and the Version line in its
+  // menu (which the server supplies) says the new number all the same. So the
+  // page knows which build it is, and loads itself again when the server has
+  // another, at a moment when nobody is in the middle of anything.
+  const BUILD = document.body.dataset.build || '';
+  function reloadIfStale() {
+    if (!BUILD || !state.me || !state.me.build || state.me.build === BUILD) return;
+    if (up.running || state.viewing || !$('sheet').hidden) return;
+    location.reload();
+  }
   async function refreshMe() {
     const was = isAdmin();
     state.me = await (await fetch('/api/me', { credentials: 'same-origin' })).json();
@@ -1030,7 +1041,7 @@
   // -------------------------------------------------------------- sheets --
   const sheet = $('sheet');
   let sheetTimer = 0;
-  function openSheet(build) {
+  function openSheet(build, again = false) {
     clearInterval(sheetTimer);
     const body = $('sheet-body');
     body.textContent = '';
@@ -1040,7 +1051,15 @@
     sheet.style.transform = '';
     sheet.hidden = false;
     $('backdrop').hidden = false;
-    if (!wasOpen) { sheet.scrollTop = 0; holdPage(true); pushHistory(); }
+    if (!wasOpen) { sheet.scrollTop = 0; holdPage(true); if (!again) pushHistory(); }
+  }
+  // The same sheet, closed and opened afresh with what `build` makes, keeping
+  // its place in the history. For a sheet whose content has changed out of all
+  // recognition: in Firefox, a menu that grew from a few lines to many while it
+  // stayed open would not scroll with two fingers until the page was reloaded.
+  function reopenSheet(build) {
+    closeSheet();
+    requestAnimationFrame(() => requestAnimationFrame(() => openSheet(build, true)));
   }
   function closeSheet() {
     clearInterval(sheetTimer);
@@ -1333,10 +1352,10 @@
   });
 
   // ------------------------------------------------- settings and admin --
-  $('open-settings').addEventListener('click', openSettings);
+  $('open-settings').addEventListener('click', () => openSettings());
 
-  function openSettings() {
-    openSheet((body) => {
+  function openSettings(again = false) {
+    (again ? reopenSheet : openSheet)((body) => {
       body.appendChild(el('h2', '', 'Settings'));
       body.appendChild(option('Video quality', segmented(
         [[0, 'Auto'], [720, '720p+'], [1080, '1080p+'], [1440, '1440p']], prefs.videoMin,
@@ -1393,7 +1412,7 @@
         const result = await api('/api/login', { password: input.value });
         await refreshMe();
         if (result.role !== 'admin') { note.textContent = 'That is not the admin password.'; return; }
-        openSettings();
+        openSettings(true);       // as if just opened: see reopenSheet
       } catch (error) {
         note.textContent = error.message;
       } finally {
@@ -1488,6 +1507,11 @@
       ['Chip misses', s.hardware.fallbacks ? `${s.hardware.fallbacks} files redone in software` : null],
     ]));
     for (const f of s.failures) target.appendChild(el('p', 'fail', `${f.rel_path}: ${f.error}`));
+    // Which files were left alone, so that nobody has to go looking for them.
+    const left = (w.last_scan && w.last_scan.left) || [];
+    const why = { partial: 'never finished arriving', empty: 'empty', other: 'not a photo or video' };
+    for (const f of left.slice(0, 12)) target.appendChild(el('p', 'muted small', `${f.path}: ${why[f.why] || f.why}`));
+    if (left.length > 12) target.appendChild(el('p', 'muted small', `and ${left.length - 12} more`));
     if (c.failed) {
       const retry = el('button', 'plain', 'Try the failed ones again');
       retry.addEventListener('click', () => api('/api/admin/retry', {}));
@@ -1512,10 +1536,9 @@
   // files travel at once; the rest wait their turn, which is what lets several
   // hundred be chosen in one go.
   //
-  // It is built for a phone on a slow link, which shapes three things. Progress
-  // is counted in bytes as they leave, not in finished pieces, so the number
-  // moves even when a piece takes a minute. A piece is sized to take a few
-  // seconds on the link as it is, so little is lost when one fails. And a
+  // It is built for a phone on a slow link, which shapes two things. A piece is
+  // sized to take a few seconds on the link as it is, so little is lost when
+  // one fails and the number on the panel moves every few seconds. And a
   // connection that drops, as it does every time a phone sleeps, is waited for:
   // the upload picks up where it stopped when the page is looked at again.
   //
@@ -1524,11 +1547,20 @@
   const PHOTO_NAME = /\.(heic|heif|jpe?g|png|webp|gif|tiff?|avif)$/i;
   const VIDEO_NAME = /\.(mov|mp4|m4v|mkv|avi|webm|3gp|mts)$/i;
   const UP_AT_ONCE = 3;
+  // How carefully pieces are sent. It starts at 0, the ordinary way. Each time
+  // a piece goes unanswered it goes up one, for as long as the page lives:
+  // with the server asked to close the connection after each answer, and in
+  // pieces no larger than this. Since pieces go by fetch (upRequest, below)
+  // nothing has been seen to need it; it is kept for a road that loses answers.
+  const UP_CARE = [Infinity, 512 * 1024, 128 * 1024, 32 * 1024];
   const UP_SMALLEST = 256 * 1024;
   const up = { piece: 4 * 1024 * 1024, jobs: [], next: 0, active: 0, done: 0, skipped: 0, failed: [],
                bytes: 0, sent: 0, running: false, stopped: false, waiting: false, ticket: null,
                rate: 0, rateAt: 0, rateSent: 0, where: '', note: '', why: '', realm: null, section: '',
-               flying: new Set(), waits: new Set(), plain: false,
+               flying: new Set(), waits: new Set(),
+               // `?care=1` (to 3) in the address starts it careful: for trying the
+               // careful ways of sending against a server where the ordinary way stalls.
+               care: clamp(Math.floor(Number(new URLSearchParams(location.search).get('care')) || 0), 0, 3),
                view: null, drawTimer: 0, shownDone: false };
 
   function upReset() {
@@ -1545,7 +1577,7 @@
       const name = file.webkitRelativePath || file.name;
       if (name.split('/').some((part) => part.startsWith('.'))) continue;      // system clutter
       if (!PHOTO_NAME.test(file.name) && !VIDEO_NAME.test(file.name)) { left += 1; continue; }
-      fresh.push({ file, realm, path: (section ? section + '/' : '') + name, sent: 0, live: 0,
+      fresh.push({ file, realm, path: (section ? section + '/' : '') + name, sent: 0,
                    id: [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('') });
     }
     // Photos before videos: the wall fills sooner, and the still of a Live
@@ -1577,7 +1609,7 @@
       }).catch((error) => {
         up.sent -= job.sent;
         up.bytes -= job.file.size;
-        job.sent = job.live = 0;
+        job.sent = 0;
         up.failed.push({ job, why: error.message });
       }).finally(() => {
         up.active -= 1;
@@ -1600,12 +1632,12 @@
     for (;;) {
       if (up.stopped) throw new Error('Stopped.');
       const began = performance.now();
-      const size = Math.min(piece, total - offset);
+      const size = Math.min(piece, total - offset, UP_CARE[up.care]);
       const result = await upPiece(job, offset, size, total);
+      if (result.again) continue;       // the same place in the file, sent more carefully
       const now = result.done ? total : result.have;
       up.sent += now - job.sent;
       job.sent = now;
-      job.live = 0;
       offset = now;
       upDraw();
       if (result.done) return result;
@@ -1649,13 +1681,19 @@
   async function upPiece(job, offset, size, total) {
     let wait = 1000;
     let asked = false;
+    const bytes = await upBytes(job, offset, size);
     for (;;) {
-      const answer = await upRequest(job, offset, size, total);
+      const answer = await upRequest(job, offset, size, total, bytes);
       if (answer.status >= 200 && answer.status < 300) {
-        if (up.waiting) { up.waiting = false; upDraw(); }
-        return answer.data;
+        // An answer that says yes says how much of the file is held. One that
+        // does not was cut short on its way here, and counts as no answer:
+        // taking it for a yes once turned every number on the panel to NaN.
+        if (answer.data.done || Number.isFinite(answer.data.have)) {
+          if (up.waiting) { up.waiting = false; upDraw(); }
+          return answer.data;
+        }
+        answer.status = 0;
       }
-      job.live = 0;
       if (answer.status === 403 && isAdmin() && !asked) {
         // The ticket has gone stale (a change of password does that). Ask once more.
         asked = true;
@@ -1669,10 +1707,17 @@
         throw new Error(answer.data.error || `Refused (${answer.status}).`);
       }
       if (up.stopped) throw new Error('Stopped.');
-      // Every byte of the piece left and no answer came back. Seen from Safari
-      // on a Mac: the server had taken each piece and said so, and the page
-      // was never told. The other way of sending is used from here on.
-      if (answer.unanswered) up.plain = true;
+      // No answer came back in good time: send more carefully from here on,
+      // starting with this same place in the file.
+      // (The server may well hold the piece; asked again, it says how far it
+      // has got and the page carries on from there.)
+      if (answer.unanswered && up.care < UP_CARE.length - 1) {
+        up.care += 1;
+        up.why = '';
+        up.waiting = true;
+        upDraw();
+        return { again: true };
+      }
       // Three different troubles, and the page should not call them all "the
       // connection": this device is offline; a piece went and no answer came
       // back; or Waterfall answered and the answer was an error of its own.
@@ -1686,6 +1731,25 @@
     }
   }
 
+  // A piece is read into memory and sent from there, which is the way that was
+  // proven from an iPhone (upRequest, below). A few megabytes held for a moment
+  // is a small price for not relying on how a browser streams a file.
+  async function upBytes(job, offset, size) {
+    const part = job.file.slice(offset, offset + size);
+    let late = 0;
+    try {
+      const bytes = await Promise.race([
+        part.arrayBuffer ? part.arrayBuffer() : new Response(part).arrayBuffer(),
+        new Promise((_, no) => { late = setTimeout(() => no(new Error('slow')), 60000); })]);
+      if (bytes.byteLength !== size) throw new Error('short');
+      return bytes;
+    } catch {
+      throw new Error('This browser could not read the file. Choose it again.');
+    } finally {
+      clearTimeout(late);
+    }
+  }
+
   const upHeaders = (job, offset, total) => {
     const headers = { 'X-Waterfall': '1', 'Content-Type': 'application/octet-stream',
                       'X-Upload-Path': encodeURIComponent(job.path), 'X-Upload-Id': job.id,
@@ -1695,64 +1759,51 @@
     return headers;
   };
 
-  // The request itself. Not fetch(): only this older interface says how much
-  // of a body has left, and that is the number a person watching needs.
-  function upRequest(job, offset, size, total) {
-    if (up.plain) return upRequestPlain(job, offset, size, total);
-    return new Promise((resolve) => {
-      const xhr = new XMLHttpRequest();
-      let stalled = 0;
-      let allLeft = false;          // every byte of this piece has gone: the answer is due
-      let unanswered = false;
-      const quiet = (ms) => {
-        clearTimeout(stalled);
-        stalled = setTimeout(() => { unanswered = allLeft; xhr.abort(); }, ms);    // start the piece again
-      };
-      const finish = (status, data) => {
-        clearTimeout(stalled);
-        up.flying.delete(xhr);
-        resolve({ status, data: data || {}, unanswered: !status && unanswered });
-      };
-      xhr.open('POST', '/api/admin/upload?realm=' + job.realm);
-      xhr.withCredentials = true;
-      xhr.responseType = 'json';
-      for (const [name, value] of Object.entries(upHeaders(job, offset, total))) xhr.setRequestHeader(name, value);
-      // Nothing moving for 45 seconds, or half a minute with no answer to a
-      // piece that has wholly gone, and the piece is given up.
-      xhr.upload.onprogress = (event) => { job.live = Math.min(size, event.loaded); if (!allLeft) quiet(45000); upDraw(); };
-      xhr.upload.onload = () => { allLeft = true; quiet(30000); };
-      xhr.onload = () => finish(xhr.status, xhr.response);
-      xhr.onerror = xhr.onabort = xhr.ontimeout = () => finish(0);
-      quiet(45000);
-      up.flying.add(xhr);
-      xhr.send(job.file.slice(offset, offset + size));
-    });
-  }
-
-  // The same piece sent the plain way, as the first version of this did. It
-  // cannot say how much has left, so the numbers move a piece at a time; it is
-  // used only once the way above has gone unanswered.
-  async function upRequestPlain(job, offset, size, total) {
+  // The request itself: fetch(), the way Waterfall 0.6.0 sent every piece.
+  // Versions 0.6.1 to 0.6.3 used XMLHttpRequest, the one interface that says
+  // how much of a body has left, and Safari (on an iPhone, and on a Mac to the
+  // NAS) never finished one that carried a piece of half a megabyte or more:
+  // the whole answer reached the phone and was read, and the request stayed
+  // open for ever, however the server answered (one packet or two, the
+  // connection kept or closed). Pieces of 32 KB and less did finish. fetch()
+  // finished every way it was tried. It cannot say how much has left, so the
+  // numbers move a piece at a time.
+  async function upRequest(job, offset, size, total, bytes) {
     const going = new AbortController();
-    const patience = setTimeout(() => going.abort(), 120000);
+    let gaveUp = false;
+    const patience = setTimeout(() => { gaveUp = true; going.abort(); }, upPatience(size));
     up.flying.add(going);
+    const headers = upHeaders(job, offset, total);
+    if (up.care) headers['X-Upload-Close'] = '1';
     try {
       const response = await fetch('/api/admin/upload?realm=' + job.realm, {
-        method: 'POST', credentials: 'same-origin', headers: upHeaders(job, offset, total),
-        body: job.file.slice(offset, offset + size), signal: going.signal });
-      return { status: response.status, data: await response.json().catch(() => ({})) };
+        method: 'POST', credentials: 'same-origin', headers, body: bytes, signal: going.signal });
+      // The whole answer, or none: one that stops part-way is no answer at all.
+      // One that is not Waterfall's own (a refusal from the web server itself)
+      // still says no by its status.
+      const text = await response.text();
+      let data = {};
+      try { data = JSON.parse(text) || {}; } catch { /* not Waterfall's own words */ }
+      return { status: response.status, data };
     } catch {
-      return { status: 0, data: {} };
+      return { status: 0, data: {}, unanswered: gaveUp };
     } finally {
       clearTimeout(patience);
       up.flying.delete(going);
     }
   }
 
+  // How long a piece may go unanswered: three quarters of a minute, and twice
+  // as long again as it should take at the speed seen so far (or at 32 KB a
+  // second, before any is known). A piece is sized to take about six seconds.
+  function upPatience(size) {
+    const each = Math.max(32 * 1024, up.rate / Math.max(1, up.active));
+    return 45000 + 2000 * size / each;
+  }
+
   // Everything the two displays need: how far, how fast, how long.
   function upState() {
-    const live = up.jobs.reduce((sum, job) => sum + (job.live || 0), 0);
-    const sent = Math.min(up.bytes, up.sent + live);
+    const sent = Math.min(up.bytes, up.sent);
     const now = performance.now();
     if (now - up.rateAt > 1000) {
       const rate = Math.max(0, (sent - up.rateSent) / ((now - up.rateAt) / 1000));
@@ -1797,6 +1848,10 @@
         if (u.state === 'sending' && u.left) bits.push(fmtLeft(u.left));
         view.append(head, meter, el('p', 'muted small', bits.join(' · ')), el('p', 'muted small', 'To ' + up.where));
         if (up.skipped) view.appendChild(el('p', 'muted small', `${plural(up.skipped, 'file')} already here, so not sent again.`));
+        if (up.care && up.running) {
+          view.appendChild(el('p', 'muted small', 'Answers were not coming back, so it is sending in smaller pieces'
+            + (UP_CARE[up.care] < 512 * 1024 ? ` (${fmtBytes(UP_CARE[up.care])}).` : '.')));
+        }
       }
       if (up.note) view.appendChild(el('p', 'muted small', up.note));
       for (const f of up.failed.slice(0, 12)) view.appendChild(el('p', 'fail', `${f.job.file.name}: ${f.why}`));
@@ -1808,7 +1863,7 @@
       } else if (!up.running && up.failed.length) {
         const again = el('button', 'plain', 'Send the failed ones again');
         again.addEventListener('click', async () => {
-          const jobs = up.failed.map((f) => Object.assign(f.job, { sent: 0, live: 0 }));
+          const jobs = up.failed.map((f) => Object.assign(f.job, { sent: 0 }));
           upReset();
           up.jobs = jobs;
           up.bytes = jobs.reduce((sum, job) => sum + job.file.size, 0);
@@ -1969,6 +2024,12 @@
     drop.addEventListener('click', () => send({ clear_viewer: true }));
     return form;
   }
+
+  // Looked at again after a while away, and every few minutes besides: is this
+  // still the code the server would hand out now?
+  const freshen = () => refreshMe().then(reloadIfStale).catch(() => {});
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) freshen(); });
+  setInterval(() => { if (!document.hidden) freshen(); }, 300000);
 
   start().catch((error) => {
     document.body.appendChild(el('p', 'center error', 'Waterfall could not start: ' + error.message));

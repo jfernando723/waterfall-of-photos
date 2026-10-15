@@ -31,7 +31,11 @@ class Worker:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._soon: threading.Timer | None = None
-        self._last_gc = time.time()     # first sweep a day after starting
+        self._last_gc = time.time()     # first sweep of unclaimed copies a day after starting
+        # What abandoned uploads left behind is cleared as Waterfall starts as
+        # well as daily: a machine restarted more often than once a day never
+        # reached the daily sweep, and they stayed for good.
+        self._swept = False
         # Every finished item's copies are looked at once when Waterfall
         # starts, which is when a power cut would have done its damage, and
         # again whenever the admin presses "Look for new files now".
@@ -118,6 +122,10 @@ class Worker:
                           last_scan={"error": f"{config.MEDIA_DIR} does not exist"})
             else:
                 self._set(last_scan=library.scan(), last_scan_at=time.time())
+                if not self._swept:
+                    self._swept = True
+                    if library.sweep_partials():
+                        self._set(last_scan=library.scan())
                 with self._lock:
                     check, self._check = self._check, False
                 if check:
@@ -144,6 +152,21 @@ class Worker:
             self._photos(photos)
             return
         self._video(todo[0])
+
+    def _meanwhile(self, full: str) -> None:
+        """Called about once a second while a video is being converted, which
+        can take hours. Two things must not wait for it to end.
+
+        A look at the folders that somebody asked for: without it, what was
+        deleted through the import door stayed on the wall until the video in
+        hand was finished. And the video itself: if its file has been removed,
+        converting it is hours of work for nothing, so it is stopped."""
+        if not os.path.isfile(full):
+            with self._lock:
+                self.state["last_scan_at"] = None       # look again before anything else
+            raise media.MediaError("It was removed while it was being converted.")
+        if self.state["last_scan_at"] is None:
+            self._set(last_scan=library.scan(), last_scan_at=time.time())
 
     def _verify(self, again: bool = False) -> None:
         """Check every finished item and keep what was found for the admin
@@ -192,6 +215,7 @@ class Worker:
         def progress(seconds_done: float) -> None:
             if duration:
                 self._set(fraction=min(1.0, seconds_done / duration))
+            self._meanwhile(full)
 
         started = time.time()
         status = library.convert(row, meta, progress)

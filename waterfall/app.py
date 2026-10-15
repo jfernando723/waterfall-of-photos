@@ -167,6 +167,7 @@ def me():
     have = role()
     return jsonify(configured=auth.is_configured(), role=have, admin=have == "admin",
                    has_viewer=auth.has_viewer(), version=__version__, pipeline=PIPELINE,
+                   build=_asset_version(),
                    simulated=config.SIMULATE_LINK or None, admin_idle=config.ADMIN_IDLE,
                    admin_left=auth.admin_seconds_left(request.cookies.get(auth.COOKIE)))
 
@@ -396,7 +397,15 @@ def admin_upload():
         return jsonify(error=exc.strerror or "The file could not be kept."), 507 if exc.errno == 28 else 500
     if result["done"] and not result.get("skipped"):
         worker.rescan_soon()
-    return jsonify(result)
+    answer = jsonify(result)
+    if head.get("X-Upload-Close") == "1":
+        # The page asks for the connection to be closed once this is answered:
+        # it has had a piece taken and answered and never been told (app.js,
+        # "How carefully pieces are sent"). An answer with no length given is
+        # one the server ends by closing the connection.
+        answer = app.response_class(iter([answer.get_data()]), mimetype="application/json")
+        answer.direct_passthrough = True
+    return answer
 
 
 @app.post("/api/admin/tag")

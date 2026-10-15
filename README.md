@@ -109,7 +109,7 @@ is made.
 ```
 git clone https://github.com/jfernando723/waterfall-of-photos.git
 cd waterfall-of-photos
-docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.6.2 .
+docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.6.3 .
 docker compose up -d
 ```
 
@@ -144,6 +144,16 @@ from the photo library arrives as a still without its clip, and the phone may sh
 video before sending it. A Live Photo keeps its clip when the still and the clip are
 copied in as two files with the same name, which is how a computer or a NAS stores them.
 
+**To send Live Photos from an iPhone with their clips** (tried on iOS 26): in Photos, select
+them, tap Share, scroll to the very bottom of the list and choose **Export Unmodified
+Original**, and save into a folder in Files. Each Live Photo is two files there,
+`IMG_1234.HEIC` and `IMG_1234.MOV`, the originals byte for byte. Then on the admin page tap
+**Choose photos and videos → Choose Files** (not Photo Library), open that folder and choose
+everything in it. Send each still with its clip, in the same go: the page sends stills first,
+so every clip finds its still, but a clip that arrives on its own before its still becomes a
+short video of its own. Edits made in Photos are not exported. AirDrop to a Mac, with
+**Options → All Photos Data** turned on, also gives the two files.
+
 ### Settings
 
 All of them go under `environment:` in `docker-compose.yml`. None is required.
@@ -172,17 +182,17 @@ the `Dockerfile`.
 |---|---|
 | The machine it is built for | Installed there once, an earlier version. It started and showed its wall. Nothing has been converted there, so its speed is not known. |
 | Copying in from File Station | **Refused on that machine by every version up to 0.6.0**, for every file, with a message about privileges, although File Station connected, listed the folders and made a new one. The log of 0.6.0 showed why: File Station browses with one program and uploads with another, and the uploader asks permission before sending a file (`Expect: 100-continue`) and gives no password until asked. The door said "go ahead" before looking for the password, then refused part-way, and the uploader cannot send a file twice. Since 0.6.1 the door looks for the password first, and File Station copies in. |
-| Uploading from the page | Works on that machine, from a computer and from an iPhone. From an iPhone a large video over a slow link is only as reliable as the phone staying awake: the page cannot stop it sleeping, though it carries on where it stopped when the page is looked at again. |
-| A bulk upload from Safari on a Mac | On that machine, on 0.6.1, one stalled at 0%: every piece Safari sent was accepted, and the page never heard so. Stop did nothing that could be seen. The same page, engine and files finish against a copy on the Mac itself, so the cause was never found. From 0.6.2 a piece that wholly left and was never answered is sent again the plain way, Stop stops at once, and the page says that no answer came back instead of blaming the connection. Not yet tried against that machine. |
+| Uploading from the page | Works on that machine, from a computer and, on 0.6.0, from an iPhone. On 0.6.1 and 0.6.2 Safari stalls, on an iPhone and on a Mac (next row); 0.6.3 cures it on an iPhone against a test copy, and has not yet been tried on that machine. From an iPhone a large video over a slow link is only as reliable as the phone staying awake: the page cannot stop it sleeping, though it carries on where it stopped when the page is looked at again. |
+| Uploading from Safari | **The cause was found in 0.6.3's making, and 0.6.3 sends the other way.** Versions 0.6.1 and 0.6.2 sent each piece of an upload with `XMLHttpRequest`, the one way a page can show how much of a piece has left. Safari never finishes such a request once it crosses a real network: the server takes the piece and answers, the device receives every byte of the answer, and the request stays open for ever. From an iPhone against a test copy, over a VPN and over the local network, not one piece of 512 KB or more finished (0 of 63), however the server answered; with `fetch`, the way 0.6.0 sent everything, they did. Safari on a Mac never shows it against a copy on the same Mac, because those requests never leave the machine, which is why it took so long to find. 0.6.3 sends every piece with `fetch`, so the percentage moves a piece at a time. Proven from an iPhone against a test copy; **not yet tried against the machine it is built for**, where a Mac's Safari stalled in the same way on 0.6.1 and 0.6.2. Firefox uploads there without trouble. |
 | Several File Station copy jobs at once | On that machine, on 0.6.1, they stopped after 178 files and sat there all night. The door's log shows it answered every request it was sent, with nothing refused and no file left half-sent, and went on answering afterwards: File Station stopped sending. One folder at a time has worked since. Why several at once stop is not known. |
 | A log that nothing is reading | With `WATERFALL_DAV_LOG` on, it stopped the door for good while the wall went on working. Found on a test machine and closed in 0.6.2; not what happened above. |
 | A power cut | From 0.6.2 a full-size file is removed only once its small copies are on the disk, a record of small copies is believed only with the copies, and every finished item is checked when Waterfall starts. Tried against imitations of what a power cut leaves, never against a real one. Up to 0.6.1 a copy damaged that way stayed on the wall as a broken picture, the admin page said all was well, and copying the file in again did not mend it. |
-| Live Photos | Work on that machine when the still and its clip are copied in together. A still without its clip is just a photo; nothing in the still says that a clip ever existed. |
+| Live Photos | Work on that machine when the still and its clip are copied in together. A still without its clip is just a photo; nothing in the still says that a clip ever existed. From an iPhone, Export Unmodified Original and then Choose Files carries both (above); tried against a test copy, not yet against that machine. A clip converted on its own before its still arrived stays a separate short video, even if it is sent again. Up to 0.6.2, a clip that was waiting for a still named like `IMG_0006.HEIC_compressed.JPEG` (as some exports name them) was never collected and stayed unseen; fixed in 0.6.3. |
 | The Intel video chip | Seen working once: on first start the admin page reported that it decodes and resizes on the chip (VAAPI). At start-up Waterfall converts a test clip through each driver and uses one only if the picture matches the software result; otherwise it converts in software and says so. No real video has been converted with it yet. |
 | Speed | Converting 4K phone video in software is slow: on the DS920+, estimated at fourteen to twenty-one times the length of the video. An estimate, not a measurement. |
 | Any other machine | Not considered. The memory ceiling, the video chip, the user and group numbers and the install steps are all the DS920+'s. |
 | Place names | The list is GeoNames' places of 500 people or more, plus every named village in Sierra Leone and in Chad, plus a short hand-made list of names in Sierra Leone. Those are the places it was made for. Anywhere else, somewhere too small for the list is named for the nearest town on it within 120 km, or not at all. `scripts/make-places.py` rebuilds the list for other countries. |
-| Browsers | Made for Safari on an iPhone. On a computer it has been tried in Firefox, Safari and Chrome on one Mac. Until 0.6.2, two fingers on a trackpad in Firefox would not scroll the settings sheet (the wall behind it moved instead) or move the viewer on. |
+| Browsers | Made for Safari on an iPhone. On a computer it has been tried in Firefox, Safari and Chrome on one Mac. Until 0.6.2, two fingers on a trackpad in Firefox would not scroll the settings sheet (the wall behind it moved instead) or move the viewer on. On that machine, on 0.6.2, the sheet in Firefox would not scroll right after the admin password was given, until the page was reloaded; that was never reproduced elsewhere, and since 0.6.3 the sheet is opened afresh after the password, as a reload would. |
 | Upgrades | No upgrade between versions has ever been tested with a library in it. |
 | The ready-made image | Built once and left. Its ffmpeg, ExifTool and everything else in it stay at the versions of that day. |
 
