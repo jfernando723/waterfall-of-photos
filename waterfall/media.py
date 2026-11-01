@@ -710,6 +710,67 @@ def make_live(path: str, target: str, fps: float | None = None) -> dict:
     return {"bytes": os.path.getsize(target), "w": w, "h": h, "has_audio": info["has_audio"]}
 
 
+# A Live Photo's key photo: the picture shown for it, on the wall and in the
+# viewer. Any moment of its clip can be made that picture instead of the still,
+# the way Photos on an iPhone does it (Edit, then Live, then Make Key Photo).
+# Two things about that are as true there as here:
+#
+#   * The clip is recorded at a fraction of the still's size (about 1920 x 1440
+#     against 4032 x 3024 or more), so a moment from it is as sharp as the
+#     still on a phone's screen and has less detail to zoom into.
+#   * The still is never altered. Its own copies stay exactly as they were, so
+#     going back to it shows what was shown before, byte for byte.
+#
+# The moment is cut from the best clip there is: the camera's own, which is
+# kept beside the copies for this, or for a Live Photo converted before that
+# was so, its small moving copy. It is decoded once into a lossless picture and
+# made into the same three sizes as any photo, never larger than the frame.
+# Choosing again starts from the clip again, so changing one's mind costs nothing.
+
+def frame_times(path: str) -> list[float]:
+    """When each frame of a video is shown, in seconds from its start, counted
+    the way a player counts them. A phone's frames need not be evenly spaced."""
+    cmd = [_ffmpeg(), "-nostdin", "-hide_banner"] + _FROM_OUTSIDE + [
+        "-i", path, "-map", "0:v:0", "-vf", "showinfo", "-f", "null", "-"]
+    run = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    found = re.findall(r"showinfo.*? n:\s*\d+ pts:\s*\S+\s+pts_time:(\S+)", run.stderr)
+    try:
+        times = [float(t) for t in found]
+    except ValueError:
+        times = []          # a frame with no time of its own: nothing to choose by
+    if not times:
+        tail = " | ".join(run.stderr.strip().splitlines()[-2:])
+        raise MediaError(f"cannot read the clip's frames: {tail[:300]}")
+    return times
+
+
+def make_key_photo(path: str, index: int, outdir: str) -> dict:
+    """The three photo sizes, made from frame `index` of a video (counted as
+    frame_times counts them), upright and in ordinary colour. Returns what the
+    index needs, as make_photo does, and the frame itself as a PNG."""
+    info = video_frame_info(path)
+    chain = [f"select=eq(n\\,{int(index)})"]
+    if info["trc"] in HDR_TRANSFERS:
+        chain.append(_TONEMAP)
+    chain.append("format=rgb24")
+    cmd = [_ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error"] + _FROM_OUTSIDE + [
+        "-i", path, "-map", "0:v:0", "-vf", ",".join(chain), "-fps_mode", "passthrough",
+        "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"]
+    run = subprocess.run(cmd, capture_output=True, timeout=300)
+    if run.returncode != 0 or not run.stdout:
+        raise MediaError("could not take that moment from the clip: "
+                         + " | ".join(run.stderr.decode(errors="replace").strip().splitlines()[-2:])[:300])
+    try:
+        img = Image.open(io.BytesIO(run.stdout))
+        img.load()
+    except Exception as exc:
+        raise MediaError(f"the moment taken from the clip could not be read: {exc}") from exc
+    img = img.convert("RGB")
+    os.makedirs(outdir, exist_ok=True)
+    return {"width": img.width, "height": img.height, "placeholder": _placeholder(img),
+            "sizes": _write_sizes(img, outdir, PHOTO_SIZES), "png": run.stdout}
+
+
 def _playlist_stats(playlist: str) -> tuple[float, int]:
     """-> (duration in seconds, the busiest segment's bitrate in bits/s).
 

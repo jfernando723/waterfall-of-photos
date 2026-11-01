@@ -39,7 +39,7 @@ No other machine has been considered.
 |---|---|
 | Opening it | The address shows the **Visible** wall at once. No sign-in, no username. |
 | Its icon | In a browser's tabs and new-tab page, and on a phone's or tablet's home screen: in Safari on an iPhone or iPad, **Share → Add to Home Screen** gives a Waterfall icon that opens the wall full screen. Drawn by `scripts/make-icons.py`. |
-| Admin | The **···** menu asks for the admin password. That opens the admin menu: the library status, adding pictures, and the switch to the **Hidden** wall. Signing in does not change the wall; the Hidden one is shown only when that switch is used. Left untouched for half an hour, the page signs the admin out by itself and goes back to the Visible wall. |
+| Admin | The **···** menu asks for the admin password. That opens the admin menu: the library status, adding pictures, and the switch to the **Hidden** wall. Signing in does not change the wall; the Hidden one is shown only when that switch is used. Left untouched for half an hour, the page signs the admin out by itself and goes back to the Visible wall. **Leaving the page puts the Visible wall back** (another app, the home screen, a locked phone, another tab, or closing it), so whoever opens it next sees that one; while the admin is still signed in, the switch brings the Hidden wall back exactly where it was. |
 | The wall | Every photo and video as a grid that never ends. Shuffle, Newest or Oldest; All, Photos or Videos. Video tiles play a few silent seconds. |
 | Sections | Each folder is a section; a folder inside a folder is a sub-section. |
 | Tags | The admin can tag an item so that it also appears in another section, without a second copy of the file. |
@@ -49,6 +49,7 @@ No other machine has been considered.
 | Hidden | Decided by the folder and by nothing else. There are two roots, `Visible` and `Hidden`. What is copied into `Hidden` needs the admin password from the moment it arrives. |
 | Adding pictures | Two ways, both needing the admin password. From the admin page: pick a wall and a folder, choose photos and videos on a phone or a computer, and they are uploaded, several hundred at a go if you like. It shows how far it has got, how fast and how long is left; it waits out a dropped connection and carries on. Or from the NAS itself: its file manager copies folders in through the import door. |
 | Live Photos | A still and its short clip, copied in together under the same name, become one item: the photo, with a LIVE button. Hold a finger on the photo, or tap LIVE, and the clip plays over it. |
+| Key photo | The admin, and only the admin, can show a Live Photo by any moment of its clip instead of its still, on the Visible and the Hidden wall alike, both on its tile and in the viewer, as Photos on an iPhone does it (**Make Key Photo**): (i) → **Change the key photo**, then a slider, one step per frame. **Original** puts the still back exactly as it was; its own copies are never touched. Anyone else sees the picture chosen and nothing else of it, and the server refuses them. |
 
 Full-size files are never sent to the phone. Each one is converted once, in advance,
 into small copies: three sizes of WebP for a photo; five sizes of H.264 and a short
@@ -65,7 +66,9 @@ real photo is in this repository, and none ever should be.
 
 **Waterfall keeps small copies only.** Once a file is converted and its copies are
 checked, Waterfall **removes the full-size file** it was given and leaves a small text
-file in its place.
+file in its place. The one exception is a Live Photo's own clip: a few megabytes, kept
+beside its copies and never sent to anyone, so that its key photo can be cut from the
+clip as the camera recorded it.
 
 If you **move** your photos into it, the copy it removes was the only one, and what
 is left is a smaller, lower-quality version. **Only ever copy files in, and keep your
@@ -110,7 +113,7 @@ is made.
 ```
 git clone https://github.com/jfernando723/waterfall-of-photos.git
 cd waterfall-of-photos
-docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.6.4 .
+docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.7.0 .
 docker compose up -d
 ```
 
@@ -189,6 +192,8 @@ the `Dockerfile`.
 | A log that nothing is reading | With `WATERFALL_DAV_LOG` on, it stopped the door for good while the wall went on working. Found on a test machine and closed in 0.6.2; not what happened above. |
 | A power cut | From 0.6.2 a full-size file is removed only once its small copies are on the disk, a record of small copies is believed only with the copies, and every finished item is checked when Waterfall starts. Tried against imitations of what a power cut leaves, never against a real one. Up to 0.6.1 a copy damaged that way stayed on the wall as a broken picture, the admin page said all was well, and copying the file in again did not mend it. |
 | Live Photos | Work on that machine when the still and its clip are copied in together. A still without its clip is just a photo; nothing in the still says that a clip ever existed. From an iPhone, Export Unmodified Original and then Choose Files carries both (above); tried against a test copy, not yet against that machine. A clip converted on its own before its still arrived stays a separate short video, even if it is sent again. Up to 0.6.2, a clip that was waiting for a still named like `IMG_0006.HEIC_compressed.JPEG` (as some exports name them) was never collected and stayed unseen; fixed in 0.6.3. |
+| Key photo | A moment of the clip is about as sharp as the still on a phone's screen and has less detail to zoom into: the clip is recorded at a fraction of the still's size (about 1920 × 1440 against 4032 × 3024 or more), which is as true of Photos on an iPhone. Measured with generated pictures, not a real phone's. A Live Photo converted before 0.7.0 kept only the small copy of its clip, 1080 on its short side and compressed a second time, so a key photo cut from it is softer; copying the still and its clip in again keeps the clip. Tried in Chrome; not yet on an iPhone. |
+| Leaving the Hidden wall | The page puts the Visible wall back the moment it is told it is hidden, which a home-screen page on an iPhone is told when it goes to the background. Tried in Chrome by telling the page so; not yet on an iPhone. What no page can change: a phone keeps its own picture of the screen as it was left, for its list of open apps, so the Hidden wall can show there, and for a moment as the page opens again, until the page draws the Visible one. |
 | The Intel video chip | Seen working once: on first start the admin page reported that it decodes and resizes on the chip (VAAPI). At start-up Waterfall converts a test clip through each driver and uses one only if the picture matches the software result; otherwise it converts in software and says so. No real video has been converted with it yet. |
 | Speed | Converting 4K phone video in software is slow: on the DS920+, estimated at fourteen to twenty-one times the length of the video. An estimate, not a measurement. |
 | Any other machine | Not considered. The memory ceiling, the video chip, the user and group numbers and the install steps are all the DS920+'s. |

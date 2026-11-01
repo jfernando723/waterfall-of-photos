@@ -42,14 +42,21 @@ Two things here are easy to get wrong and are deliberate:
     without converting anything again. Tags are hand-made and cannot be
     regenerated, so they are written to a `tags.json` in the same place and
     read back the same way. They belong to the content, not the path: move a
-    file to another folder and its tags come with it.
+    file to another folder and its tags come with it. A Live Photo's chosen
+    key photo is hand-made too, and is kept the same way, in a `key.json`.
+  * A Live Photo's own clip is the one full-size file that is kept: it is a
+    few megabytes, never sent to anyone, and it is what a new key photo is cut
+    from (media.make_key_photo says why that matters).
 """
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import threading
@@ -460,13 +467,17 @@ def verify(progress=None) -> dict:
     listed as failed with the words "Import it again", which is the truth.
     Reads only, apart from marking what it finds."""
     con = connect()
-    rows = con.execute("SELECT id, key, kind FROM items WHERE status='ready'").fetchall()
+    rows = con.execute("SELECT id, key, kind, info FROM items WHERE status='ready'").fetchall()
     whole: dict[tuple, bool] = {}
     damaged = []
     for n, row in enumerate(rows, 1):
         which = (row["key"], row["kind"])
         if which not in whole:
-            whole[which] = bool(row["key"]) and _load_done(row["key"], row["kind"]) is not None
+            # A chosen key photo is looked at too. One whose copies are not all
+            # there is let go of when the item is sent back: the still is shown
+            # again, and the moment can be chosen again.
+            whole[which] = bool(row["key"]) and _load_done(row["key"], row["kind"]) is not None \
+                and ('"kf"' not in (row["info"] or "") or _key_record(row["key"]) is not None)
         if not whole[which]:
             damaged.append((row["id"],))
         if progress and n % 25 == 0:
@@ -641,46 +652,113 @@ def _live_twin(con, row, meta: dict):
         [row["section_id"], row["id"]] + params).fetchone()
 
 
-def _index_fields(done: dict) -> tuple[str, int]:
-    """What the index keeps of a finished item: its details, and how much room
-    its copies take."""
+def _presented(key: str, done: dict) -> dict:
+    """What the index keeps of a finished item: how it is shown (its size and
+    its blur), its details, and how much room its copies take. A Live Photo
+    whose key photo has been chosen is shown by that picture; everything else
+    about it is still the still's."""
     info = {k: done[k] for k in ("meta", "sizes", "rungs", "hdr", "has_audio", "made_by", "live") if k in done}
+    shown = {"width": done["width"], "height": done["height"], "placeholder": done["placeholder"]}
     copy_bytes = sum(v for v in (done.get("sizes") or {}).values() if isinstance(v, int)) \
         + sum(r["bytes"] for r in done.get("rungs") or [])
-    return json.dumps(info), copy_bytes
+    record = _key_record(key) if done.get("kind") == "photo" and done.get("live") else None
+    if record:
+        shown = {"width": record["width"], "height": record["height"], "placeholder": record["placeholder"]}
+        info["kf"] = record["folder"]
+        info["key_photo"] = {"from": record["from"], "time": record["time"], "w": record["width"],
+                             "h": record["height"], "still": [done["width"], done["height"]]}
+        copy_bytes += sum(record["sizes"].values())
+    return {**shown, "info": json.dumps(info), "copy_bytes": copy_bytes}
+
+
+def _write_done(key: str, done: dict) -> None:
+    tmp = _done_path(key) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(done, f)
+    os.replace(tmp, _done_path(key))
+
+
+def _show(con, key: str, done: dict) -> dict:
+    """Bring every finished photo with this content up to date in the index."""
+    shown = _presented(key, done)
+    with con:
+        con.execute("UPDATE items SET width=?, height=?, placeholder=?, info=?, copy_bytes=? "
+                    "WHERE key=? AND kind='photo' AND status='ready'",
+                    (shown["width"], shown["height"], shown["placeholder"], shown["info"],
+                     shown["copy_bytes"], key))
+    return shown
 
 
 def _keep_motion(con, row, key: str, twin, full: str, meta: dict) -> str:
     """File a Live Photo's clip with its still: one small moving copy beside
     the still's own copies, played when the photo is pressed. The clip is not
-    an item, so once that copy exists the clip itself is not kept."""
+    an item. Unless the full-size files are kept where they are, the clip
+    itself is moved in beside the copies, for cutting a key photo from."""
     with con:
         con.execute("UPDATE items SET status='paired', key=?, error=NULL WHERE id=?", (key, row["id"]))
     done = _load_done(twin["key"], "photo") if twin["status"] == "ready" and twin["key"] else None
     if done is None:
         return "paired"         # the still is not converted yet: it sends for this clip when it is
-    made = media.make_live(full, os.path.join(media.deriv_dir(twin["key"]), "live.mp4"),
-                           fps=meta.get("VideoFrameRate"))
+    folder = media.deriv_dir(twin["key"])
+    made = media.make_live(full, os.path.join(folder, "live.mp4"), fps=meta.get("VideoFrameRate"))
     done.setdefault("sizes", {})["live"] = made["bytes"]
     done["live"] = {"w": made["w"], "h": made["h"], "has_audio": made["has_audio"],
                     "duration": round(float(meta.get("Duration") or 0), 3)}
-    tmp = _done_path(twin["key"]) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(done, f)
-    os.replace(tmp, _done_path(twin["key"]))
-    info, copy_bytes = _index_fields(done)
-    with con:
-        con.execute("UPDATE items SET info=?, copy_bytes=? WHERE key=? AND kind='photo' AND status='ready'",
-                    (info, copy_bytes, twin["key"]))
+    _write_done(twin["key"], done)
+    _show(con, twin["key"], done)
     if not config.KEEP_ORIGINALS:
         try:
             copies_to_disk(twin["key"], done)
-            os.remove(full)
+            name = "clip" + os.path.splitext(full)[1].lower()
+            _keep_clip(full, os.path.join(folder, name))
+            # Written down only once it is true: a record never claims a clip
+            # that a power cut kept from arriving.
+            done["clip"] = name
+            done["sizes"]["clip"] = os.path.getsize(os.path.join(folder, name))
+            _write_done(twin["key"], done)
+            _show(con, twin["key"], done)
             with con:
                 con.execute("DELETE FROM items WHERE id=?", (row["id"],))
         except OSError:
-            pass
+            pass                # for instance a read-only library: the clip simply stays where it is
     return "paired"
+
+
+def _keep_clip(full: str, target: str) -> None:
+    """Move a Live Photo's own clip in beside its still's copies, and have it
+    on the disk there. Raises OSError, with the clip still where it was, if it
+    cannot be."""
+    folder = os.path.dirname(target)
+    try:
+        os.replace(full, target)                # the same disk: a new name, nothing copied
+        moved = True
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        # Another disk: copied, and on the disk, before the original goes.
+        part = os.path.join(folder, ".clip.part")
+        try:
+            shutil.copyfile(full, part)
+            _to_disk(part)
+            os.replace(part, target)
+        except OSError:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            raise
+        moved = False
+    _to_disk(target)
+    for where in (folder, os.path.dirname(full)):
+        try:
+            _to_disk(where)
+        except OSError:
+            pass                # not every filesystem will do this for a folder
+    if not moved:
+        os.remove(full)
+    for name in os.listdir(folder):     # one clip per Live Photo, whatever its ending
+        if _is_clip(name) and name != os.path.basename(target):
+            os.remove(os.path.join(folder, name))
 
 
 def _send_for_motion(con, row) -> None:
@@ -738,19 +816,16 @@ def convert(row, meta: dict | None = None, progress=None) -> str:
             local, ts, src = media.taken_at(meta, full)
             done = {"pipeline": PIPELINE, "kind": row["kind"], "taken_local": local,
                     "taken_ts": ts, "taken_src": src, "meta": media.describe(meta), **result}
-            tmp = _done_path(key) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(done, f)
-            os.replace(tmp, _done_path(key))
-        info, copy_bytes = _index_fields(done)
+            _write_done(key, done)
+        shown = _presented(key, done)
         with con:
             con.execute(
                 "UPDATE items SET status='ready', key=?, error=NULL, taken_local=?, taken_ts=?, "
                 "taken_src=?, width=?, height=?, duration=?, placeholder=?, info=?, copy_bytes=?, "
                 "trashed=? WHERE id=?",
-                (key, done["taken_local"], done["taken_ts"], done["taken_src"], done["width"],
-                 done["height"], done.get("duration"), done["placeholder"], info,
-                 copy_bytes, 1 if gone else 0, row["id"]))
+                (key, done["taken_local"], done["taken_ts"], done["taken_src"], shown["width"],
+                 shown["height"], done.get("duration"), shown["placeholder"], shown["info"],
+                 shown["copy_bytes"], 1 if gone else 0, row["id"]))
         _restore_tags(con, key)
         if row["kind"] == "photo":
             _send_for_motion(con, row)
@@ -836,10 +911,10 @@ def sections(realm: str) -> list[dict]:
         else:
             cover_where, cover_params = _under(sec["path"])
         cover = con.execute(
-            "SELECT i.key, i.placeholder FROM items i JOIN sections s ON s.id=i.section_id "
+            "SELECT i.key, i.placeholder, i.info FROM items i JOIN sections s ON s.id=i.section_id "
             f"WHERE i.status='ready' AND {cover_where} ORDER BY i.taken_ts DESC LIMIT 1",
             cover_params).fetchone()
-        sec["cover"] = dict(cover) if cover else None
+        sec["cover"] = _cover(cover)
         sec["depth"] = max(0, sec["path"].count("/") - 1)
         sec["path"] = _label(sec["path"])
         listed.append(sec)
@@ -910,8 +985,22 @@ def feed(realm: str, section_id: int | None, order: str, seed: int, offset: int,
                 entry["p"] = 1          # has a moving preview for the wall
         elif r["info"] and '"live"' in r["info"]:
             entry["lv"] = 1             # a Live Photo: pressing it plays its clip
+            if '"kf"' in r["info"]:
+                # ...and it is shown by a moment chosen from that clip, whose
+                # copies have a folder of their own (see the key photo, below).
+                entry["kf"] = json.loads(r["info"]).get("kf")
         out.append(entry)
     return out
+
+
+def _cover(row) -> dict | None:
+    """The picture that stands for a section or a tag: its newest item's."""
+    if not row:
+        return None
+    found = {"key": row["key"], "placeholder": row["placeholder"]}
+    if row["info"] and '"kf"' in row["info"]:
+        found["kf"] = json.loads(row["info"]).get("kf")
+    return found
 
 
 def item(item_id: int, allow_hidden: bool) -> dict | None:
@@ -1023,11 +1112,11 @@ def tag_list(realm: str) -> list[dict]:
         if r["tag"].lower() in names:
             continue
         cover = con.execute(
-            "SELECT i.key, i.placeholder FROM items i JOIN sections s ON s.id=i.section_id "
+            "SELECT i.key, i.placeholder, i.info FROM items i JOIN sections s ON s.id=i.section_id "
             f"WHERE i.status='ready' AND {where} AND i.key IN (SELECT key FROM tags WHERE tag = ?) "
             "ORDER BY i.taken_ts DESC LIMIT 1", params + [r["tag"]]).fetchone()
         out.append({"tag": r["tag"], "photos": r["photos"] or 0, "videos": r["videos"] or 0,
-                    "cover": dict(cover) if cover else None})
+                    "cover": _cover(cover)})
     return out
 
 
@@ -1048,6 +1137,189 @@ def tag_suggestions(realm: str) -> list[str]:
             seen.add(name.lower())
             out.append(name)
     return out
+
+
+# ---------------------------------------------------------------- key photo --
+#
+# A Live Photo can be shown by any moment of its clip instead of its still
+# (media.make_key_photo says what that costs and what it cannot). The moment's
+# three sizes live in a folder of their own beside the still's copies, named
+# for what is in them (k-<12 hex>), so that their addresses change when the
+# picture does and a phone's year-long cache can never show the old one. The
+# still's own copies are never touched, and `key.json` says which folder is
+# in use. Like tags, the choice belongs to the content and outlives the index.
+
+KEY_RECORD = "key.json"
+_KEY_FOLDER = re.compile(r"^k-[0-9a-f]{12}$")
+_key_lock = threading.Lock()
+
+
+def _key_record(key: str) -> dict | None:
+    """The key photo chosen for this content, if one was and its copies are
+    all there at the size they were made. Reads only."""
+    folder = media.deriv_dir(key)
+    try:
+        with open(os.path.join(folder, KEY_RECORD), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or not _KEY_FOLDER.match(str(record.get("folder", ""))) \
+            or set(record.get("sizes") or {}) != {"t", "m", "l"}:
+        return None
+    for name, size in record["sizes"].items():
+        try:
+            if os.path.getsize(os.path.join(folder, record["folder"], f"{name}.webp")) != size:
+                return None
+        except OSError:
+            return None
+    return record
+
+
+def _is_clip(name: str) -> bool:
+    """`clip` and a video's ending: the name a kept clip is given."""
+    stem, ending = os.path.splitext(name)
+    return stem == "clip" and ending.lower() in config.VIDEO_EXT
+
+
+def _kept_clip(key: str) -> str | None:
+    """The camera's own clip of a Live Photo, kept beside its copies."""
+    folder = media.deriv_dir(key)
+    try:
+        names = sorted(n for n in os.listdir(folder) if _is_clip(n))
+    except OSError:
+        return None
+    for name in names:
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
+
+def _clip_beside(con, row) -> str | None:
+    """The clip still in the folders beside its still: where it stays when the
+    full-size files are kept, or when moving it in was cut short. Found the way
+    _send_for_motion finds it."""
+    still = row["rel_path"].lower()
+    for r in con.execute("SELECT rel_path FROM items WHERE kind='video' AND status='paired' AND section_id=?",
+                         (row["section_id"],)).fetchall():
+        if still.startswith(os.path.splitext(r["rel_path"])[0].lower() + "."):
+            path = os.path.join(config.MEDIA_DIR, r["rel_path"])
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def _key_source(con, row) -> tuple[str, str]:
+    """The best clip to cut a key photo from, and which it is: 'clip', the
+    camera's own, or 'copy', the small moving copy made for playing."""
+    found = _kept_clip(row["key"]) or _clip_beside(con, row)
+    if found:
+        return found, "clip"
+    return os.path.join(media.deriv_dir(row["key"]), "live.mp4"), "copy"
+
+
+def _live_still(con, item_id: int):
+    """(the row, its record) for a finished Live Photo; None for no such item.
+    Raises ValueError for an item that is not a Live Photo."""
+    row = con.execute("SELECT id, key, rel_path, section_id, kind, status FROM items WHERE id=?",
+                      (item_id,)).fetchone()
+    if not row or row["status"] != "ready":
+        return None
+    done = _load_done(row["key"], "photo") if row["kind"] == "photo" and row["key"] else None
+    if not done or not done.get("live"):
+        raise ValueError("Only a Live Photo has other moments to choose from.")
+    return row, done
+
+
+def key_photo_choices(item_id: int) -> dict | None:
+    """What the page needs to offer the moments of a Live Photo: when each
+    frame of the clip it plays is shown, which one is the key photo now (None:
+    the still), and what a new one would be cut from, at what size."""
+    con = connect()
+    found = _live_still(con, item_id)
+    if found is None:
+        return None
+    row, done = found
+    times = media.frame_times(os.path.join(media.deriv_dir(row["key"]), "live.mp4"))
+    record = _key_record(row["key"])
+    source, kind = _key_source(con, row)
+    size = media.video_frame_info(source)
+    return {"frames": times, "chosen": record["frame"] if record else None, "from": kind,
+            "size": [size["width"], size["height"]]}
+
+
+def choose_key_photo(item_id: int, frame: int | None) -> dict | None:
+    """Make one moment of a Live Photo's clip its key photo; or, with None, go
+    back to the still. `frame` counts the frames of the clip the page plays
+    (key_photo_choices). Returns how the item is shown now, or None if there is
+    no such item. The still's own copies are not touched either way."""
+    con = connect()
+    found = _live_still(con, item_id)
+    if found is None:
+        return None
+    row, done = found
+    folder = media.deriv_dir(row["key"])
+    with _key_lock:
+        keep = None
+        if frame is None:
+            try:
+                os.remove(os.path.join(folder, KEY_RECORD))
+            except FileNotFoundError:
+                pass
+        else:
+            times = media.frame_times(os.path.join(folder, "live.mp4"))
+            if not 0 <= frame < len(times):
+                raise ValueError("There is no such moment in the clip.")
+            at = times[frame]
+            source, kind = _key_source(con, row)
+            index = frame
+            if kind == "clip":
+                # The camera's clip can have more frames than the copy played
+                # (a copy plays at most 30 a second): the one shown at that moment.
+                theirs = media.frame_times(source)
+                index = min(range(len(theirs)), key=lambda i: abs(theirs[i] - at))
+            work = os.path.join(folder, f".k-{os.getpid()}-{threading.get_ident()}")
+            shutil.rmtree(work, ignore_errors=True)
+            try:
+                made = media.make_key_photo(source, index, work)
+                keep = "k-" + hashlib.sha256(made["png"]).hexdigest()[:12]
+                final = os.path.join(folder, keep)
+                whole = all(os.path.isfile(os.path.join(final, f"{name}.webp"))
+                            and os.path.getsize(os.path.join(final, f"{name}.webp")) == size
+                            for name, size in made["sizes"].items())
+                if whole:
+                    shutil.rmtree(work)                 # the same moment again: already there, whole
+                else:
+                    shutil.rmtree(final, ignore_errors=True)
+                    os.replace(work, final)
+            except BaseException:
+                shutil.rmtree(work, ignore_errors=True)
+                raise
+            for name in made["sizes"]:
+                _to_disk(os.path.join(final, f"{name}.webp"))
+            _to_disk(final)
+            record = {"waterfall": 1, "folder": keep, "frame": frame, "time": round(at, 6), "from": kind,
+                      "width": made["width"], "height": made["height"],
+                      "placeholder": made["placeholder"], "sizes": made["sizes"],
+                      "chosen": time.strftime("%Y-%m-%d")}
+            tmp = os.path.join(folder, KEY_RECORD + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, os.path.join(folder, KEY_RECORD))
+            try:
+                _to_disk(folder)
+            except OSError:
+                pass
+        shown = _show(con, row["key"], done)
+        # Moments chosen before this one are of no more use.
+        for name in os.listdir(folder):
+            if _KEY_FOLDER.match(name) and name != keep:
+                shutil.rmtree(os.path.join(folder, name), ignore_errors=True)
+    info = json.loads(shown["info"])
+    return {"kf": info.get("kf"), "w": shown["width"], "h": shown["height"], "ph": shown["placeholder"],
+            "key_photo": info.get("key_photo")}
 
 
 def counts() -> dict:

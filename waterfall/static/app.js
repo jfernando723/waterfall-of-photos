@@ -49,7 +49,7 @@
     realm: 'visible',
     sections: [], sectionById: new Map(), totals: { photos: 0, videos: 0 }, tags: [],
     section: null, tag: null, kind: 'all', seed: newSeed(),
-    items: [], more: true, loading: false, generation: 0,
+    items: [], more: true, loading: false, pending: null, generation: 0,
     cols: [], heights: [],
     viewing: false, current: -1, wantSound: false,
   };
@@ -120,9 +120,15 @@
       // whatever the sign-in itself has left.
       lastActive = lastRenewed = Date.now() - Math.max(0, (state.me.admin_idle - state.me.admin_left) * 1000);
     }
-    if (!state.me.admin) state.realm = 'visible';
+    // The Hidden wall's place is kept only while the sign-in lasts. Taking the
+    // wall itself off the screen is setRealm's: whoever asked does that.
+    if (!state.me.admin) forgetHiddenPlace();
   }
   const murl = (item, name) => `/m/${state.pipeline}/${item.key}/${name}`;
+  // A photo at one of its three sizes, 't', 'm' or 'l'. A Live Photo shown by
+  // a moment of its clip has that moment's three sizes, in a folder named for
+  // what is in them (`kf`), so a new choice is never hidden by an old cache.
+  const photoUrl = (item, size) => murl(item, (item.kf ? item.kf + '/' : '') + size + '.webp');
 
   // ------------------------------------------------------------- helpers --
   const fmtBytes = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + ' GB'
@@ -240,7 +246,9 @@
   }
 
   async function loadSections() {
-    const data = await api('/api/sections?realm=' + state.realm);
+    const realm = state.realm;
+    const data = await api('/api/sections?realm=' + realm);
+    if (realm !== state.realm) return;      // the wall was switched meanwhile: these are the other's
     state.sections = data.sections;
     state.totals = data.totals;
     state.sectionById = new Map(data.sections.map((s) => [s.id, s]));
@@ -249,18 +257,134 @@
     if (state.tag !== null && !state.tags.some((t) => t.tag.toLowerCase() === state.tag.toLowerCase())) state.tag = null;
   }
 
-  // Switching wall is the one place the two are told apart, so it resets
-  // everything: no item from one can linger on screen in the other.
+  // Switching wall is the one place the two are told apart. The screen is
+  // emptied at once and filled again from the other wall's own items, so no
+  // item from one can linger on screen in the other. Each wall comes back as
+  // it was left (see "places", below); the same wall asked for again starts
+  // afresh, as it always has.
   async function setRealm(realm) {
+    const target = realm === 'hidden' && isAdmin() ? 'hidden' : 'visible';
+    const switching = target !== state.realm;
+    if (switching) keepPlace();
     unwindHistory();
     closeViewer(true);
     closeSheet();
-    state.realm = realm === 'hidden' && isAdmin() ? 'hidden' : 'visible';
+    const place = !switching ? null : target === 'hidden' ? places.hidden || readHiddenPlace() : places.visible;
+    state.realm = target;
+    if (place) return showPlace(place);
     state.section = null;
     state.tag = null;
+    clearWall();
     try { await loadSections(); } catch { /* the wall will say what is wrong */ }
-    resetWall();
+    if (state.realm === target) resetWall();
   }
+
+  // ------------------------------------------------------------- places --
+  // Each wall keeps its place while the other one is shown: what had been
+  // loaded, in what order, how far down, and which section, tag or kind.
+  //
+  // Leaving Waterfall while the Hidden wall is up puts the Visible wall back at
+  // once, whatever the device: another app, the Home Screen, the phone locked,
+  // another tab, or Waterfall closed. So whoever opens it next sees the Visible
+  // wall, and the Wall switch brings the Hidden one back as it was for as long
+  // as the admin is still signed in. That place is also written down on this
+  // device, so that it outlives Waterfall being closed: which section, which
+  // order, how far down, and nothing else, no picture and no file's name. It
+  // is forgotten the moment the sign-in ends.
+  //
+  // One thing no page can do: a phone keeps a picture of the screen as it was
+  // left, for its list of open apps, and takes it itself.
+  const places = { visible: null, hidden: null };
+  const HIDDEN_PLACE = 'waterfall.hidden-place';
+
+  function tileNearTop() {
+    const below = $('bar').getBoundingClientRect().bottom;
+    let best = -1, top = Infinity;
+    for (const tile of $('grid').querySelectorAll('.tile')) {
+      const box = tile.getBoundingClientRect();
+      if (box.bottom > below && box.top < top) { best = Number(tile.dataset.index); top = box.top; }
+    }
+    return best;
+  }
+
+  function keepPlace() {
+    if (state.realm === 'hidden' && !isAdmin()) return forgetHiddenPlace();
+    places[state.realm] = {
+      section: state.section, tag: state.tag, kind: state.kind, order: prefs.order, seed: state.seed,
+      items: state.items, more: state.more, sections: state.sections, totals: state.totals, tags: state.tags,
+      // Where it was: the item open in the viewer, or else the scroll position,
+      // which is exact while the window is as wide (the tiles lie as they did).
+      y: Math.round(window.scrollY), width: window.innerWidth,
+      viewing: state.viewing, at: state.viewing ? state.current : tileNearTop() };
+    if (state.realm === 'hidden') writeHiddenPlace();
+  }
+
+  function writeHiddenPlace() {
+    const place = places.hidden;
+    if (!place) return;
+    const { section, tag, kind, order, seed, more, y, width, viewing, at } = place;
+    try {
+      localStorage.setItem(HIDDEN_PLACE, JSON.stringify({
+        section, tag, kind, order, seed, more, y, width, viewing, at,
+        count: place.items ? place.items.length : place.count,
+        until: lastActive + idleLimit() }));     // never past the end of the sign-in it was kept under
+    } catch { /* storage refused (a private window): it is kept while the page lives */ }
+  }
+
+  function readHiddenPlace() {
+    try {
+      const place = JSON.parse(localStorage.getItem(HIDDEN_PLACE) || 'null');
+      if (place && place.until > Date.now()) return place;
+    } catch { /* unreadable: the wall starts afresh */ }
+    forgetHiddenPlace();
+    return null;
+  }
+
+  function forgetHiddenPlace() {
+    places.hidden = null;
+    try { localStorage.removeItem(HIDDEN_PLACE); } catch { /* nothing was kept */ }
+  }
+
+  async function showPlace(place) {
+    Object.assign(state, { section: place.section, tag: place.tag, kind: place.kind, seed: place.seed });
+    prefs.order = place.order;
+    savePrefs();
+    setPressed('order', 'order', prefs.order);
+    setPressed('kind', 'kind', state.kind);
+    if (place.items) {
+      // Kept while the page lived: shown at once, with nothing to ask the server.
+      Object.assign(state, { sections: place.sections, totals: place.totals, tags: place.tags,
+                             sectionById: new Map(place.sections.map((s) => [s.id, s])) });
+      resetWall(place);
+      return goBackTo(place);
+    }
+    // Written down before Waterfall was closed: the same pages are asked for
+    // again with the same order and the same shuffle, and come back the same.
+    const realm = state.realm;
+    clearWall();
+    try { await loadSections(); } catch { /* the wall will say what is wrong */ }
+    if (state.realm !== realm) return;
+    resetWall();
+    const generation = state.generation;
+    await loadUpTo(place.count);
+    if (generation === state.generation) goBackTo(place);
+  }
+
+  function goBackTo(place) {
+    if (!place.viewing && place.width === window.innerWidth) return window.scrollTo(0, place.y);
+    const tile = $('grid').querySelector(`.tile[data-index="${place.at}"]`);
+    if (tile) tile.scrollIntoView({ block: 'center' });
+  }
+
+  // Leaving while the Hidden wall is up. Everything that takes it off the
+  // screen happens before the first wait for the server, so it is done before
+  // the page is put to sleep; the Visible wall is drawn from what was kept.
+  function leftWaterfall() {
+    if (state.realm === 'hidden') setRealm('visible');
+    else writeHiddenPlace();            // a place kept from before: good for as long as the sign-in
+  }
+  document.addEventListener('visibilitychange', () => { if (document.hidden) leftWaterfall(); });
+  window.addEventListener('pagehide', leftWaterfall);
 
   function columnCount() {
     const w = window.innerWidth;
@@ -278,7 +402,8 @@
     }
   }
 
-  function resetWall() {
+  // Nothing on the wall, at once: what is drawn next belongs to state.realm.
+  function clearWall() {
     stopAllPreviews();
     inView.clear();
     previewWatcher.disconnect();
@@ -286,10 +411,20 @@
     state.items = [];
     state.more = true;
     state.loading = false;
+    state.pending = null;
     buildColumns();
     const hidden = state.realm === 'hidden';
     $('bar').classList.toggle('is-hidden', hidden);
     $('realm-tag').hidden = !hidden;
+    $('title-text').textContent = 'Everything';
+    $('wall-count').textContent = '';
+    $('wall-status').textContent = '';
+    window.scrollTo(0, 0);
+  }
+
+  // The wall afresh, or, given a place kept with its items, as it was left.
+  function resetWall(kept) {
+    clearWall();
     const current = state.section === null ? null : state.sectionById.get(state.section);
     const tagged = state.tag === null ? null
       : state.tags.find((t) => t.tag.toLowerCase() === state.tag.toLowerCase());
@@ -299,41 +434,63 @@
       : [state.totals.photos, state.totals.videos];
     const shown = state.kind === 'photo' ? totals[0] : state.kind === 'video' ? totals[1] : totals[0] + totals[1];
     $('wall-count').textContent = shown ? plural(shown, 'item') : '';
-    $('wall-status').textContent = '';
-    window.scrollTo(0, 0);
-    loadMore();
+    if (!kept || !kept.items) return loadMore();
+    state.items = kept.items.slice();
+    state.more = kept.more;
+    state.items.forEach(addTile);
+    sayWhatIsLeft();
   }
 
-  async function loadMore() {
-    if (state.loading || !state.more) return;
+  function sayWhatIsLeft() {
+    if (!state.items.length) {
+      $('wall-status').textContent = isAdmin()
+        ? 'Nothing here yet. Add photos and videos from the ··· menu.'
+        : 'Nothing here yet.';
+    } else if (!state.more) {
+      $('wall-status').textContent = 'That is everything.';
+    }
+  }
+
+  // The next page of the feed. Asked again while one is on its way, it hands
+  // back the same one rather than asking twice.
+  function loadMore(limit = 40) {
+    if (state.loading) return state.pending;
+    if (!state.more) return Promise.resolve();
     state.loading = true;
     const generation = state.generation;
     const query = new URLSearchParams({
       realm: state.realm, order: prefs.order, seed: state.seed,
-      offset: state.items.length, limit: 40, kind: state.kind,
+      offset: state.items.length, limit, kind: state.kind,
     });
     if (state.section !== null) query.set('section', state.section);
     if (state.tag !== null) query.set('tag', state.tag);
-    try {
-      const data = await api('/api/feed?' + query);
-      if (generation !== state.generation) return;      // the wall was reset meanwhile
-      const base = state.items.length;
-      state.items.push(...data.items);
-      state.more = data.more;
-      data.items.forEach((item, i) => addTile(item, base + i));
-      if (!state.items.length) {
-        $('wall-status').textContent = isAdmin()
-          ? 'Nothing here yet. Add photos and videos from the ··· menu.'
-          : 'Nothing here yet.';
-      } else if (!state.more) {
-        $('wall-status').textContent = 'That is everything.';
+    state.pending = (async () => {
+      try {
+        const data = await api('/api/feed?' + query);
+        if (generation !== state.generation) return;      // the wall was reset meanwhile
+        const base = state.items.length;
+        state.items.push(...data.items);
+        state.more = data.more;
+        data.items.forEach((item, i) => addTile(item, base + i));
+        sayWhatIsLeft();
+      } catch (error) {
+        if (generation === state.generation && error.message !== 'Signed out.') {
+          $('wall-status').textContent = error.message;
+        }
+      } finally {
+        if (generation === state.generation) { state.loading = false; state.pending = null; }
       }
-    } catch (error) {
-      if (generation === state.generation && error.message !== 'Signed out.') {
-        $('wall-status').textContent = error.message;
-      }
-    } finally {
-      if (generation === state.generation) state.loading = false;
+    })();
+    return state.pending;
+  }
+
+  // At least `count` items, as many pages as that takes (to bring back a place).
+  async function loadUpTo(count) {
+    const generation = state.generation;
+    while (generation === state.generation && state.more && state.items.length < count) {
+      const had = state.items.length;
+      await loadMore(100);
+      if (state.items.length === had) break;      // nothing came: the wall says why
     }
   }
 
@@ -348,7 +505,7 @@
     img.decoding = 'async';
     img.alt = '';
     img.addEventListener('load', () => img.classList.add('in'), { once: true });
-    img.src = murl(item, 't.webp');
+    img.src = photoUrl(item, 't');
     tile.appendChild(img);
     if (item.k === 'v') {
       tile.appendChild(el('span', 'badge', fmtClock(item.d)));
@@ -542,13 +699,13 @@
       const low = el('img');
       low.alt = '';
       low.draggable = false;
-      low.src = murl(item, 't.webp');
+      low.src = photoUrl(item, 't');
       const sharp = el('img', 'sharp');
       sharp.alt = '';
       sharp.draggable = false;
       sharp.decoding = 'async';
       sharp.addEventListener('load', () => sharp.classList.add('in'), { once: true });
-      sharp.src = murl(item, prefs.photoHigh ? 'l.webp' : 'm.webp');
+      sharp.src = photoUrl(item, prefs.photoHigh ? 'l' : 'm');
       slide.dataset.size = prefs.photoHigh ? 'l' : 'm';
       slide.classList.add('photo');
       const layer = el('div', 'zoom');       // what pinching scales and dragging moves
@@ -617,7 +774,7 @@
       warmed.add(item.id);
       // For a photo this is the whole picture. For a video it is the poster:
       // the swipe lands on a sharp still while the first seconds arrive.
-      new Image().src = murl(item, item.k === 'v' || !prefs.photoHigh ? 'm.webp' : 'l.webp');
+      new Image().src = photoUrl(item, item.k === 'v' || !prefs.photoHigh ? 'm' : 'l');
     }
     // The very next video also starts buffering, so it plays the moment it
     // is reached. Only one, so a quick flick past it wastes little.
@@ -725,9 +882,7 @@
   let liveHold = 0;                   // timer: a finger resting on a Live Photo
   let liveHeld = false;               // the clip is playing because a finger is down
 
-  function playLive(slide) {
-    const item = state.items[Number(slide.dataset.index)];
-    if (!item || !item.lv) return;
+  function liveClip(slide, item) {
     let clip = slide.querySelector('video.live');
     if (!clip) {
       clip = el('video', 'live');
@@ -741,6 +896,12 @@
       clip.src = murl(item, 'live.mp4');
       slide.querySelector('.zoom').appendChild(clip);
     }
+    return clip;
+  }
+  function playLive(slide) {
+    const item = state.items[Number(slide.dataset.index)];
+    if (!item || !item.lv || keyer.slide) return;
+    const clip = liveClip(slide, item);
     slide.classList.add('live-on');
     $('viewer-live').classList.add('on');
     clip.muted = !state.wantSound;
@@ -766,6 +927,138 @@
     if (slide.classList.contains('live-on')) stopLive(slide); else playLive(slide);
   });
 
+  // ----------------------------------------------------------- key photo --
+  // A Live Photo can be shown, on the wall and here, by any moment of its clip
+  // instead of its still, as Photos on an iPhone allows (Edit, Live, Make Key
+  // Photo). The clip lies paused over the photo with a slider under it, one
+  // step for each frame, and nothing changes until Make Key Photo is pressed.
+  // Original puts the still back exactly as it was. Only the admin can do it,
+  // as with tags.
+  const keyer = { slide: null, item: null, frames: [], box: null, range: null, say: null, from: null, size: null };
+
+  function keyerSeek(index) {
+    const clip = keyer.slide && keyer.slide.querySelector('video.live');
+    if (!clip || !keyer.frames.length) return;
+    const i = clamp(index, 0, keyer.frames.length - 1);
+    keyer.range.value = String(i);
+    // A little after the frame's own start, so that the frame shown is that
+    // one and not the one before it.
+    const at = keyer.frames[i];
+    const next = i + 1 < keyer.frames.length ? keyer.frames[i + 1] : at + 0.04;
+    const go = () => { try { clip.currentTime = at + Math.min(0.005, (next - at) / 4); } catch { /* not ready */ } };
+    if (clip.readyState >= 1) go(); else clip.addEventListener('loadedmetadata', go, { once: true });
+    keyer.say.textContent = `Moment ${i + 1} of ${keyer.frames.length} · `
+      + (keyer.from === 'clip' ? "from the camera's clip" : 'from the small copy of the clip')
+      + (keyer.size ? `, ${keyer.size[0]} × ${keyer.size[1]}` : '');
+  }
+
+  async function openKeyer(index) {
+    const slide = slides.get(index);
+    const item = state.items[index];
+    if (!slide || !item || !item.lv || !isAdmin() || keyer.slide || index !== state.current) return;
+    resetZoom(false);
+    stopLive(slide);
+    Object.assign(keyer, { slide, item, frames: [] });
+    $('viewer').classList.add('keying');
+    deck.classList.add('held');             // no swiping on to another item meanwhile
+    const box = keyer.box = el('div', 'keyer');
+    const strip = el('div', 'keyer-strip');
+    const back = el('button', '', '‹');
+    back.setAttribute('aria-label', 'One frame back');
+    const range = keyer.range = el('input');
+    range.type = 'range';
+    range.min = '0';
+    range.step = '1';
+    range.setAttribute('aria-label', 'Moment');
+    const on = el('button', '', '›');
+    on.setAttribute('aria-label', 'One frame on');
+    strip.append(back, range, on);
+    keyer.say = el('p', 'muted small', 'Loading the clip…');
+    const row = el('div', 'keyer-row');
+    const cancel = el('button', '', 'Cancel');
+    const original = el('button', '', 'Original');
+    original.hidden = !item.kf;
+    const make = el('button', 'make', 'Make Key Photo');
+    row.append(cancel, original, make);
+    box.append(strip, keyer.say, row);
+    $('viewer').appendChild(box);
+    const buttons = [back, range, on, original, make];
+    for (const b of buttons) b.disabled = true;
+    cancel.addEventListener('click', closeKeyer);
+    back.addEventListener('click', () => keyerSeek(Number(range.value) - 1));
+    on.addEventListener('click', () => keyerSeek(Number(range.value) + 1));
+    range.addEventListener('input', () => keyerSeek(Number(range.value)));
+
+    const choose = async (frame) => {
+      for (const b of buttons) b.disabled = true;
+      keyer.say.textContent = frame === null ? 'Putting the photo back…' : 'Making the key photo…';
+      try {
+        const now = await api('/api/admin/key-photo', { id: item.id, frame });
+        closeKeyer();
+        showKeyPhoto(item, now);
+      } catch (error) {
+        if (keyer.box !== box) return;
+        keyer.say.textContent = error.message;
+        for (const b of buttons) b.disabled = false;
+      }
+    };
+    make.addEventListener('click', () => choose(Number(range.value)));
+    original.addEventListener('click', () => choose(null));
+
+    // The clip is asked to play now, silently, while the tap that opened this
+    // still counts as one: a phone may fetch nothing of a clip until it has
+    // been asked to play it, and in Low Power Mode plays nothing a tap did not
+    // ask for. It is stopped on a moment as soon as the moments are known.
+    const clip = liveClip(slide, item);
+    clip.muted = true;
+    const started = clip.play();
+    if (started && started.catch) started.catch(() => {});
+    let found;
+    try { found = await api('/api/admin/key-photo/' + item.id); } catch (error) {
+      if (keyer.box === box) keyer.say.textContent = error.message;
+      return;
+    }
+    if (keyer.box !== box) return;          // closed while the moments were on their way
+    Object.assign(keyer, { frames: found.frames, from: found.from, size: found.size });
+    range.max = String(found.frames.length - 1);
+    clip.pause();
+    clip.classList.add('in');
+    keyerSeek(found.chosen === null ? Math.floor((found.frames.length - 1) / 2) : found.chosen);
+    for (const b of buttons) b.disabled = false;
+  }
+
+  function closeKeyer() {
+    if (!keyer.slide) return;
+    const clip = keyer.slide.querySelector('video.live');
+    if (clip) { clip.pause(); clip.classList.remove('in'); }
+    if (keyer.box) keyer.box.remove();
+    $('viewer').classList.remove('keying');
+    deck.classList.remove('held');
+    Object.assign(keyer, { slide: null, item: null, frames: [], box: null, range: null, say: null,
+                           from: null, size: null });
+  }
+
+  // The new picture, everywhere this page shows the item: its tile on the
+  // wall and its slide in the viewer, which is made again around it.
+  function showKeyPhoto(item, now) {
+    if (now.kf) item.kf = now.kf; else delete item.kf;
+    Object.assign(item, { w: now.w, h: now.h, ph: now.ph });
+    const index = state.items.indexOf(item);
+    const tile = $('grid').querySelector(`.tile[data-index="${index}"]`);
+    if (tile) {
+      tile.style.aspectRatio = `1 / ${Math.min(2.2, Math.max(0.45, item.h / item.w))}`;
+      if (item.ph) tile.style.backgroundImage = `url(data:image/webp;base64,${item.ph})`;
+      const img = tile.querySelector('img');
+      img.classList.remove('in');
+      img.addEventListener('load', () => img.classList.add('in'), { once: true });
+      img.src = photoUrl(item, 't');
+    }
+    if (state.viewing && slides.has(index)) {
+      dropSlide(index);
+      renderWindow();
+    }
+  }
+
   function openViewer(index) {
     stopAllPreviews();
     state.viewing = true;
@@ -781,6 +1074,7 @@
 
   function closeViewer(silent) {
     if (!state.viewing) return;
+    closeKeyer();
     resetZoom(false);
     state.viewing = false;
     clearTimeout(settle);
@@ -800,6 +1094,12 @@
   // The viewer and the sheets each add a history entry, so the phone's back
   // gesture closes them. Jumping straight to another section has to remove
   // however many of those are stacked up, without reacting to its own unwinding.
+  //
+  // The page puts the wall where it belongs itself (closing the viewer, or
+  // bringing a wall back to its place), so the browser is asked not to move it
+  // as it goes back through these steps: it would put back where the wall was
+  // when each one was taken, after the page had already moved it.
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
   let pushed = 0;
   let unwinding = false;
   function pushHistory() { pushed += 1; history.pushState({ waterfall: pushed }, ''); }
@@ -860,7 +1160,7 @@
     const item = state.items[state.current];
     if (!zoom.slide || !item || zoom.slide.dataset.size === 'l' || zoom.s < 1.5) return;
     zoom.slide.dataset.size = 'l';
-    zoom.slide.querySelector('img.sharp').src = murl(item, 'l.webp');
+    zoom.slide.querySelector('img.sharp').src = photoUrl(item, 'l');
   }
   function pointIn(event) {
     const box = deck.getBoundingClientRect();
@@ -876,6 +1176,7 @@
   }
 
   deck.addEventListener('pointerdown', (event) => {
+    if (keyer.slide) return;           // choosing a key photo: the picture stays as it is
     if (event.pointerType === 'mouse' && event.button !== 0) return;
     const slide = event.target.closest('.slide.photo');
     if (!slide || Number(slide.dataset.index) !== state.current) return;
@@ -1029,6 +1330,16 @@
   window.addEventListener('keydown', (event) => {
     if (!state.viewing || !$('sheet').hidden) {
       if (event.key === 'Escape' && !$('sheet').hidden) history.back();
+      return;
+    }
+    if (keyer.slide) {
+      // Choosing a key photo: the arrows move a frame, Escape leaves it as it was.
+      const by = { ArrowLeft: -1, ArrowRight: 1 }[event.key];
+      if (event.key === 'Escape') closeKeyer();
+      else if (by && event.target !== keyer.range && keyer.range && !keyer.range.disabled) {
+        event.preventDefault();
+        keyerSeek(Number(keyer.range.value) + by);
+      }
       return;
     }
     const by = { ArrowDown: 1, ArrowRight: 1, ' ': 1, PageDown: 1, ArrowUp: -1, ArrowLeft: -1, PageUp: -1 }[event.key];
@@ -1268,7 +1579,11 @@
           (choice) => setVideoSize(choice)), true));
       }
 
-      const megapixels = d.kind === 'photo' ? ` (${(d.width * d.height / 1e6).toFixed(0)} MP)` : '';
+      // A Live Photo shown by a moment of its clip is that moment's size on the
+      // wall; the photo as taken is the still's.
+      const kp = d.key_photo;
+      const [w, h] = kp ? kp.still : [d.width, d.height];
+      const megapixels = d.kind === 'photo' ? ` (${(w * h / 1e6).toFixed(0)} MP)` : '';
       const kind = [meta.format, meta.codec, d.hdr ? 'HDR original' : null,
                     meta.fps ? meta.fps + ' fps' : null].filter(Boolean).join(' · ');
       let showing = null;
@@ -1277,9 +1592,16 @@
       } else if (d.kind === 'photo' && slide) {
         showing = slide.dataset.size === 'l' ? 'Large copy' : 'Screen copy';
       }
+      // Choosing a key photo is the admin's, on either wall, and so is all that
+      // is said about it here. Anyone else sees the picture chosen, and these
+      // details as they always were.
+      const keying = d.live && isAdmin();
       body.appendChild(rows([
         ['Type', (d.kind === 'video' ? 'Video' : d.live ? 'Live Photo' : 'Photo') + (kind ? ' · ' + kind : '')],
-        ['Size', `${d.width} × ${d.height}${megapixels}`],
+        ['Size', `${w} × ${h}${megapixels}`],
+        ['Key photo', !keying ? null : kp
+          ? `A moment from the ${kp.from === 'clip' ? 'clip' : "clip's small copy"}, ${kp.w} × ${kp.h}`
+          : 'The photo as taken'],
         ['Length', d.kind === 'video' ? fmtClock(d.duration) : null],
         ['Showing', showing],
         ['Original', fmtBytes(d.size) + (d.trashed ? ' (not kept: small copies only)' : '')],
@@ -1287,6 +1609,15 @@
         ['Lens', meta.lens],
         ['Exposure', meta.exposure],
       ]));
+      if (keying && slide) {
+        const change = el('button', 'plain', 'Change the key photo');
+        change.addEventListener('click', () => {
+          const index = state.current;
+          history.back();                 // the sheet closes; the viewer stays on this item
+          openKeyer(index);
+        });
+        body.appendChild(change);
+      }
 
       body.appendChild(el('h3', '', 'Copies on the server'));
       if (d.kind === 'video') {
@@ -1297,12 +1628,13 @@
         const s = d.sizes || {};
         body.appendChild(rows([['Thumbnail', s.t && fmtBytes(s.t)], ['Screen', s.m && fmtBytes(s.m)],
                                ['Large', s.l && fmtBytes(s.l)],
-                               ['Live clip', s.live && `${fmtBytes(s.live)} · hold the photo, or tap LIVE, to play it`]]));
+                               ['Live clip', s.live && `${fmtBytes(s.live)} · hold the photo, or tap LIVE, to play it`],
+                               ['Clip as taken', keying && s.clip && `${fmtBytes(s.clip)} · kept for choosing the key photo, never sent`]]));
         if (slide && slide.dataset.size !== 'l') {
           const best = el('button', 'plain', 'Show the large copy');
           best.addEventListener('click', () => {
             const sharp = slide.querySelector('img.sharp');
-            if (sharp) { sharp.src = murl(item, 'l.webp'); slide.dataset.size = 'l'; }
+            if (sharp) { sharp.src = photoUrl(item, 'l'); slide.dataset.size = 'l'; }
             history.back();
           });
           body.appendChild(best);
@@ -1326,7 +1658,7 @@
         const open = el('button', 'section-row' + (current ? ' current' : ''));
         open.style.paddingLeft = depth * 18 + 'px';
         const thumb = el('div', 'cover');
-        if (cover) thumb.style.backgroundImage = `url(${murl(cover, 't.webp')})`;
+        if (cover) thumb.style.backgroundImage = `url(${photoUrl(cover, 't')})`;
         const text = el('div', 'text');
         text.append(el('div', 'name', name), el('div', 'muted small', detail));
         open.append(thumb, text);
@@ -2026,8 +2358,13 @@
   }
 
   // Looked at again after a while away, and every few minutes besides: is this
-  // still the code the server would hand out now?
-  const freshen = () => refreshMe().then(reloadIfStale).catch(() => {});
+  // still the code the server would hand out now, and is this still the admin?
+  // A sign-in can run out on the server a little before the page's own clock
+  // says so, and the Hidden wall must not stay up when it has.
+  const freshen = () => refreshMe().then(() => {
+    if (state.realm === 'hidden' && !isAdmin()) return setRealm('visible');
+    reloadIfStale();
+  }).catch(() => {});
   document.addEventListener('visibilitychange', () => { if (!document.hidden) freshen(); });
   setInterval(() => { if (!document.hidden) freshen(); }, 300000);
 

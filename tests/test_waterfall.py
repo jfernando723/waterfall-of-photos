@@ -29,10 +29,12 @@ import http.client
 import io
 import json
 import os
+import re
 import resource
 import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1103,6 +1105,69 @@ class TestHTTP(unittest.TestCase):
         self.assertIn("openSettings(true)", unlock, "it shows the admin menu instead")
         self.assertEqual(js.count("setRealm('hidden')"), 0, "nothing chooses the Hidden wall but the switch")
 
+    def test_leaving_with_the_hidden_wall_up_puts_the_visible_one_back(self):
+        # Asked for: leaving Waterfall for another app, the Home Screen or a
+        # locked phone, or closing it, must not leave the Hidden wall up for
+        # whoever opens it next; and the Hidden wall comes back as it was, from
+        # the Wall switch, while the admin is still signed in. No test here can
+        # leave a page (scripts/browsers/walls.py does, in a real browser); this
+        # keeps the pieces from being undone.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        hook = "document.addEventListener('visibilitychange', () => { if (document.hidden) leftWaterfall(); });"
+        self.assertIn(hook, js)
+        self.assertIn("window.addEventListener('pagehide', leftWaterfall);", js)
+        left = js[js.index("function leftWaterfall()"):js.index(hook)]
+        self.assertIn("if (state.realm === 'hidden') setRealm('visible');", left)
+        # Everything that takes the Hidden wall off the screen happens before the
+        # first wait for the server: a phone puts the page to sleep straight away.
+        realm = js[js.index("async function setRealm(realm)"):js.index("const places = {")]
+        wait = realm.index("await ")
+        for step in ("keepPlace()", "closeViewer(true)", "closeSheet()", "return showPlace(place)", "clearWall()"):
+            self.assertLess(realm.index(step), wait, step)
+        show = js[js.index("async function showPlace(place)"):js.index("function goBackTo(place)")]
+        self.assertLess(show.index("resetWall(place)"), show.index("await "), "a place kept is drawn with no wait")
+        # What is written down on the device is where the wall was, never what was on it.
+        write = js[js.index("function writeHiddenPlace()"):js.index("function readHiddenPlace()")]
+        self.assertEqual(re.findall(r"\b(items|sections|tags|totals|keys?)\b", write), ["items", "items"],
+                         "the items only counted")
+        self.assertIn("until: lastActive + idleLimit()", write)
+        # ...and it is forgotten when the sign-in ends, however it ends.
+        me = js[js.index("async function refreshMe()"):js.index("const murl =")]
+        self.assertIn("if (!state.me.admin) forgetHiddenPlace();", me)
+        self.assertIn("if (state.realm === 'hidden' && !isAdmin()) return forgetHiddenPlace();", js)
+        fresh = js[js.index("const freshen ="):]
+        self.assertIn("if (state.realm === 'hidden' && !isAdmin()) return setRealm('visible');", fresh,
+                      "a sign-in that ran out on the server takes the Hidden wall down too")
+        self.assertIn("history.scrollRestoration = 'manual'", js,
+                      "or going back through the steps moves the wall from where it was put back")
+
+    def test_only_the_admin_is_offered_a_key_photo_and_on_either_wall(self):
+        # Asked for outright: choosing a key photo is for the admin, on both
+        # walls. Anyone else sees the picture chosen and nothing else of it.
+        # The server refuses everyone else (TestKeyPhoto); this keeps the page
+        # from offering it to them, or from offering it on one wall only.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        details = js[js.index("$('viewer-info').addEventListener('click'"):js.index("// ------------------------------------------------------------ sections --")]
+        self.assertIn("const keying = d.live && isAdmin();", details)
+        self.assertIn("['Key photo', !keying ? null", details)
+        self.assertIn("if (keying && slide) {", details)
+        self.assertIn("['Clip as taken', keying && s.clip", details)
+        self.assertEqual(details.count("Change the key photo"), 1)
+        opener = js[js.index("async function openKeyer(index)"):js.index("function closeKeyer()")]
+        self.assertIn("!isAdmin()", opener)
+        for code in (opener, details):
+            self.assertNotIn("state.realm", code, "neither wall is left out")
+            self.assertNotIn("'hidden'", code)
+
+    def test_a_photo_is_always_named_through_its_key_photo(self):
+        # A Live Photo shown by a moment of its clip has that moment's own
+        # copies: every place the page names a photo's picture has to ask
+        # photoUrl, or that place would go on showing the still.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        self.assertEqual(js.count("'t.webp'") + js.count("'l.webp'"), 0)
+        self.assertEqual(js.count("'m.webp'"), 1, "a video's poster only, which no key photo replaces")
+        self.assertGreaterEqual(js.count("photoUrl("), 8)
+
     def test_the_admin_page_is_told_what_a_look_found_and_what_a_check_found(self):
         c = self.client(ADMIN)
         found = c.get("/api/admin/status").get_json()["worker"]
@@ -1634,6 +1699,328 @@ class TestLivePhotos(unittest.TestCase):
         os.remove(os.path.join(media.deriv_dir(key), "live.mp4"))
         self.assertFalse(library.copies_complete(key, library._load_done(key, "photo")),
                          "a Live Photo whose clip has gone missing is not complete")
+
+
+class TestKeyPhoto(unittest.TestCase):
+    """A Live Photo can be shown by any moment of its clip instead of its still.
+
+    What is promised, and checked here: the still's own copies are never
+    touched, so going back to it is exact; the moment is cut from the camera's
+    own clip, kept for this, straight into the three photo sizes, never larger
+    than the frame; choosing again starts from the clip again, so no change of
+    mind costs anything; and the choice is hidden, kept and checked like
+    everything else about an item. What cannot be promised is that a moment of
+    the clip is as detailed as the still: the clip is recorded smaller."""
+
+    @classmethod
+    def setUpClass(cls):
+        from waterfall.app import app
+        cls.app = app
+        cls.dir = tempfile.mkdtemp(prefix="waterfall-key-")
+        point_at(os.path.join(cls.dir, "data"), os.path.join(cls.dir, "data", "media"))
+        config.KEEP_ORIGINALS = False
+        visible = os.path.join(config.MEDIA_DIR, "Visible", "Days")
+        hidden = os.path.join(config.MEDIA_DIR, "Hidden", "Nights")
+        fixtures.photo(os.path.join(visible, "IMG_8001.HEIC"), 2016, 1512, "key")
+        # The size reported for recent iPhones' Live Photo clips: larger than the
+        # small copy made for playing (1080 on its short side).
+        cls.clip = fixtures.video(os.path.join(visible, "IMG_8001.MOV"), 1920, 1440, 2, source="testsrc2")
+        with open(cls.clip, "rb") as f:
+            cls.clip_digest = hashlib.sha256(f.read()).hexdigest()
+        fixtures.photo(os.path.join(visible, "IMG_8003.HEIC"), 2016, 1512, "not live")
+        # As an iPhone records one held upright: sideways, a turn flag, HDR.
+        fixtures.photo(os.path.join(hidden, "IMG_8002.HEIC"), 1512, 2016, "hidden key")
+        fixtures.video(os.path.join(hidden, "IMG_8002.MOV"), 640, 480, 2, hdr=True, rotate=90)
+        convert_everything()
+        auth.set_passwords(ADMIN, None)
+
+    @classmethod
+    def tearDownClass(cls):
+        config.KEEP_ORIGINALS = True
+        point_at(DATA)
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def setUp(self):
+        auth._FAILS.clear()
+        point_at(os.path.join(self.dir, "data"), os.path.join(self.dir, "data", "media"))
+        config.KEEP_ORIGINALS = False
+        for name in ("IMG_8001.HEIC", "IMG_8002.HEIC"):      # every test starts from the still
+            library.choose_key_photo(item_named(name)["id"], None)
+
+    def admin(self):
+        c = self.app.test_client()
+        self.assertEqual(c.post("/api/login", json={"password": ADMIN}, headers={"X-Waterfall": "1"}).status_code, 200)
+        return c
+
+    def choose(self, c, name, frame):
+        r = c.post("/api/admin/key-photo", json={"id": item_named(name)["id"], "frame": frame},
+                   headers={"X-Waterfall": "1"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        return r.get_json()
+
+    def copies(self, key, folder=""):
+        found = {}
+        for name in ("t.webp", "m.webp", "l.webp"):
+            with open(os.path.join(media.deriv_dir(key), folder, name), "rb") as f:
+                found[name] = hashlib.sha256(f.read()).hexdigest()
+        return found
+
+    def frames(self, video, wanted):
+        """Those frames of a video, decoded exactly, in one pass: {n: picture}."""
+        from PIL import Image
+        out = tempfile.mkdtemp(dir=self.dir)
+        pick = "+".join(f"eq(n\\,{n})" for n in sorted(wanted))
+        subprocess.run([config.FFMPEG, "-nostdin", "-loglevel", "error", "-i", video, "-vf",
+                        f"select={pick},format=rgb24", "-fps_mode", "passthrough", os.path.join(out, "%d.png")],
+                       check=True)
+        found = {n: Image.open(os.path.join(out, f"{i}.png")).convert("RGB")
+                 for i, n in enumerate(sorted(wanted), 1)}
+        shutil.rmtree(out, ignore_errors=True)
+        return found
+
+    @staticmethod
+    def apart(a, b):
+        from PIL import ImageChops, ImageStat
+        return sum(ImageStat.Stat(ImageChops.difference(a, b)).mean) / 3
+
+    def test_the_clip_as_taken_is_kept_beside_the_copies_and_never_served(self):
+        still = item_named("IMG_8001.HEIC")
+        folder = media.deriv_dir(still["key"])
+        with open(os.path.join(folder, "clip.mov"), "rb") as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), self.clip_digest, "the clip byte for byte")
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.clip))),
+                         ["IMG_8001.HEIC.waterfall.txt", "IMG_8003.HEIC.waterfall.txt"],
+                         "it is not left in the folder: the folders hold stand-ins only")
+        self.assertEqual(still["sizes"]["clip"], os.path.getsize(os.path.join(folder, "clip.mov")))
+        self.assertEqual(library.counts()["paired"], 0)
+        self.assertGreaterEqual(library.connect().execute(
+            "SELECT copy_bytes FROM items WHERE id=?", (still["id"],)).fetchone()["copy_bytes"],
+            still["sizes"]["clip"], "the room it takes is counted")
+        for c in (self.app.test_client(), self.admin()):
+            for name in ("clip.mov", "key.json", "k-000000000000/clip.mov"):
+                self.assertEqual(c.get(f"/m/{PIPELINE}/{still['key']}/{name}").status_code, 404, name)
+
+    def test_a_moment_becomes_the_key_photo_and_the_still_is_not_touched(self):
+        c = self.admin()
+        still = item_named("IMG_8001.HEIC")
+        before = self.copies(still["key"])
+        choices = c.get(f"/api/admin/key-photo/{still['id']}").get_json()
+        self.assertEqual((choices["from"], choices["size"], choices["chosen"]), ("clip", [1920, 1440], None))
+        self.assertEqual(len(choices["frames"]), 60)
+        self.assertEqual(choices["frames"], sorted(choices["frames"]))
+        now = self.choose(c, "IMG_8001.HEIC", 30)
+        self.assertRegex(now["kf"], r"^k-[0-9a-f]{12}$")
+        self.assertEqual((now["w"], now["h"]), (1920, 1440), "shown at the moment's own size, the clip's whole frame")
+        self.assertEqual(now["key_photo"]["from"], "clip")
+        self.assertAlmostEqual(now["key_photo"]["time"], choices["frames"][30], places=4)
+        feed = c.get("/api/feed?order=new&limit=100").get_json()["items"]
+        shown = next(i for i in feed if i["id"] == still["id"])
+        self.assertEqual((shown["kf"], shown["w"], shown["h"], shown["ph"]), (now["kf"], 1920, 1440, now["ph"]))
+        self.assertNotIn("kf", next(i for i in feed if i["id"] == item_named("IMG_8003.HEIC")["id"]))
+        sizes = {}
+        from PIL import Image
+        for name in ("t", "m", "l"):
+            r = c.get(f"/m/{PIPELINE}/{still['key']}/{now['kf']}/{name}.webp")
+            self.assertEqual((r.status_code, r.mimetype), (200, "image/webp"))
+            self.assertIn("immutable", r.headers["Cache-Control"])
+            sizes[name] = Image.open(io.BytesIO(r.data)).size
+        self.assertEqual(sizes, {"t": (400, 300), "m": (1680, 1260), "l": (1920, 1440)},
+                         "the photo sizes, and never larger than the frame")
+        self.assertEqual(self.copies(still["key"]), before, "the still's own copies, byte for byte")
+        self.assertEqual(c.get(f"/m/{PIPELINE}/{still['key']}/l.webp").status_code, 200,
+                         "and they are still there to go back to")
+        found = c.get(f"/api/item/{still['id']}").get_json()
+        self.assertEqual(found["key_photo"]["still"], [2016, 1512])
+        self.assertEqual(c.get(f"/api/admin/key-photo/{still['id']}").get_json()["chosen"], 30)
+
+    def test_the_key_photo_is_the_moment_chosen_cut_from_the_clip_as_taken(self):
+        c = self.admin()
+        still = item_named("IMG_8001.HEIC")
+        now = self.choose(c, "IMG_8001.HEIC", 40)
+        from PIL import Image
+        made = Image.open(os.path.join(media.deriv_dir(still["key"]), now["kf"], "l.webp")).convert("RGB")
+        kept = self.frames(os.path.join(media.deriv_dir(still["key"]), "clip.mov"), (10, 34, 39, 40, 41, 46))
+        that = self.apart(made, kept[40])
+        self.assertLess(that, 3, "the frame chosen, through one compression only")
+        for other in (39, 41, 34, 46, 10):
+            self.assertGreater(self.apart(made, kept[other]), that + 2, f"not frame {other}")
+        # The whole of the camera's frame: the small copy has less of it.
+        small = self.frames(os.path.join(media.deriv_dir(still["key"]), "live.mp4"), (40,))[40]
+        self.assertEqual((made.size, small.size), ((1920, 1440), (1440, 1080)))
+
+    def test_changing_ones_mind_costs_nothing(self):
+        c = self.admin()
+        key = item_named("IMG_8001.HEIC")["key"]
+        first = self.choose(c, "IMG_8001.HEIC", 12)
+        made = self.copies(key, first["kf"])
+        second = self.choose(c, "IMG_8001.HEIC", 50)
+        self.assertNotEqual(second["kf"], first["kf"], "a new picture has a new address")
+        self.assertEqual(sorted(n for n in os.listdir(media.deriv_dir(key)) if n.startswith("k-")), [second["kf"]],
+                         "the moment chosen before is not kept")
+        again = self.choose(c, "IMG_8001.HEIC", 12)
+        self.assertEqual(again["kf"], first["kf"])
+        self.assertEqual(self.copies(key, again["kf"]), made,
+                         "the same moment again is the same picture, byte for byte: every choice starts from the clip")
+
+    def test_original_puts_the_still_back_exactly(self):
+        c = self.admin()
+        still = item_named("IMG_8001.HEIC")
+        before = self.copies(still["key"])
+        row = lambda: dict(library.connect().execute(
+            "SELECT width, height, placeholder FROM items WHERE id=?", (still["id"],)).fetchone())
+        was = row()
+        self.choose(c, "IMG_8001.HEIC", 20)
+        self.assertNotEqual(row(), was)
+        back = self.choose(c, "IMG_8001.HEIC", None)
+        self.assertEqual((back["kf"], back["key_photo"]), (None, None))
+        self.assertEqual(row(), was, "shown at its own size, with its own blur, again")
+        self.assertEqual(self.copies(still["key"]), before)
+        left = os.listdir(media.deriv_dir(still["key"]))
+        self.assertFalse([n for n in left if n.startswith("k-") or n == "key.json"], left)
+        feed = c.get("/api/feed?order=new&limit=100").get_json()["items"]
+        self.assertNotIn("kf", next(i for i in feed if i["id"] == still["id"]))
+
+    def test_a_hidden_live_photos_key_photo_is_hidden_and_upright(self):
+        c = self.admin()
+        still = item_named("IMG_8002.HEIC")
+        choices = c.get(f"/api/admin/key-photo/{still['id']}").get_json()
+        self.assertEqual(choices["size"], [480, 640], "a clip stored sideways is offered upright")
+        now = self.choose(c, "IMG_8002.HEIC", 15)
+        self.assertEqual((now["w"], now["h"]), (480, 640))
+        url = f"/m/{PIPELINE}/{still['key']}/{now['kf']}/m.webp"
+        self.assertEqual(self.app.test_client().get(url).status_code, 404, "knowing the address is not enough")
+        self.assertEqual(c.get(url).status_code, 200)
+        every = json.dumps(self.app.test_client().get("/api/feed?limit=100").get_json()) \
+            + json.dumps(self.app.test_client().get("/api/sections").get_json())
+        self.assertNotIn(now["kf"], every)
+        hidden = c.get("/api/sections?realm=hidden").get_json()["sections"]
+        self.assertEqual([s["cover"].get("kf") for s in hidden if s["name"] == "Nights"], [now["kf"]],
+                         "a section's cover is its newest item as it is shown")
+
+    def test_only_the_admin_and_only_from_our_own_page(self):
+        still = item_named("IMG_8001.HEIC")
+        stranger, c = self.app.test_client(), self.admin()
+        self.assertEqual(stranger.get(f"/api/admin/key-photo/{still['id']}").status_code, 403)
+        self.assertEqual(stranger.post("/api/admin/key-photo", json={"id": still["id"], "frame": 3},
+                                       headers={"X-Waterfall": "1"}).status_code, 403)
+        self.assertEqual(c.post("/api/admin/key-photo", json={"id": still["id"], "frame": 3}).status_code, 400,
+                         "without our own header")
+        for body in ({"id": still["id"], "frame": "3"}, {"id": str(still["id"]), "frame": 3},
+                     {"id": still["id"], "frame": 1.5}, {"frame": 3}):
+            self.assertEqual(c.post("/api/admin/key-photo", json=body, headers={"X-Waterfall": "1"}).status_code,
+                             400, body)
+        self.assertEqual(c.post("/api/admin/key-photo", json={"id": still["id"], "frame": 60},
+                                headers={"X-Waterfall": "1"}).status_code, 400, "past the last frame")
+        self.assertEqual(c.post("/api/admin/key-photo", json={"id": still["id"], "frame": -1},
+                                headers={"X-Waterfall": "1"}).status_code, 400)
+        plain = item_named("IMG_8003.HEIC")["id"]
+        r = c.post("/api/admin/key-photo", json={"id": plain, "frame": 1}, headers={"X-Waterfall": "1"})
+        self.assertEqual(r.status_code, 400, "a photo with no clip has no other moment")
+        self.assertIn("Live Photo", r.get_json()["error"])
+        self.assertEqual(c.get(f"/api/admin/key-photo/{plain}").status_code, 400)
+        self.assertEqual(c.get("/api/admin/key-photo/999999").status_code, 404)
+        self.assertNotIn("kf", c.get(f"/api/item/{still['id']}").get_json(), "nothing refused changed anything")
+
+    def test_only_the_admin_may_choose_and_on_either_wall(self):
+        # Asked for outright: choosing a key photo is for the admin, on the
+        # Visible wall and the Hidden one alike, and for nobody else.
+        walls = {"visible": item_named("IMG_8001.HEIC"), "hidden": item_named("IMG_8002.HEIC")}
+
+        def asks(c, still):
+            return (c.get(f"/api/admin/key-photo/{still['id']}").status_code,
+                    c.post("/api/admin/key-photo", json={"id": still["id"], "frame": 3},
+                           headers={"X-Waterfall": "1"}).status_code)
+
+        admin = self.admin()
+        for wall, still in walls.items():
+            self.assertEqual(asks(admin, still), (200, 200), f"the admin, on the {wall} wall")
+            self.choose(admin, still["name"], None)
+        ticket = admin.post("/api/admin/upload-ticket", headers={"X-Waterfall": "1"}).get_json()["ticket"]
+        stranger = self.app.test_client()
+        for wall, still in walls.items():
+            self.assertEqual(asks(stranger, still), (403, 403), f"anyone, on the {wall} wall")
+            r = stranger.post("/api/admin/key-photo", json={"id": still["id"], "frame": 3},
+                              headers={"X-Waterfall": "1", "X-Upload-Ticket": ticket})
+            self.assertEqual(r.status_code, 403, "a ticket to go on uploading is not the admin")
+        real = time.time
+        try:
+            time.time = lambda: real() + config.ADMIN_IDLE + 60
+            for wall, still in walls.items():
+                self.assertEqual(asks(admin, still), (403, 403), f"the admin left alone too long, {wall} wall")
+        finally:
+            time.time = real
+        auth.set_passwords(None, VIEWER)
+        try:
+            viewer = self.app.test_client()
+            self.assertEqual(viewer.post("/api/login", json={"password": VIEWER},
+                                         headers={"X-Waterfall": "1"}).get_json()["role"], "viewer")
+            for wall, still in walls.items():
+                self.assertEqual(asks(viewer, still), (403, 403), f"someone with the viewing password, {wall} wall")
+        finally:
+            auth.set_passwords(None, None, clear_viewer=True)
+        for still in walls.values():
+            self.assertNotIn("kf", item_named(still["name"]), "nothing refused changed anything")
+
+    def test_the_choice_outlives_the_index(self):
+        c = self.admin()
+        now = self.choose(c, "IMG_8001.HEIC", 25)
+        scratch = os.path.join(self.dir, "rebuilt")
+        os.makedirs(scratch, exist_ok=True)
+        if not os.path.exists(os.path.join(scratch, "d")):
+            os.symlink(os.path.join(self.dir, "data", "d"), os.path.join(scratch, "d"))
+        library.close()
+        auth.forget_cached()
+        config.DATA_DIR, config.DB_PATH = scratch, os.path.join(scratch, "waterfall.db")
+        try:
+            convert_everything()
+            shown = next(i for i in library.feed("visible", None, "new", 1, 0, 100) if i.get("kf"))
+            self.assertEqual((shown["kf"], shown["w"], shown["h"]), (now["kf"], 1920, 1440))
+        finally:
+            library.close()
+            shutil.rmtree(scratch, ignore_errors=True)
+            point_at(os.path.join(self.dir, "data"), os.path.join(self.dir, "data", "media"))
+
+    def test_a_damaged_key_photo_is_let_go_of_and_the_still_shown(self):
+        c = self.admin()
+        still = item_named("IMG_8001.HEIC")
+        now = self.choose(c, "IMG_8001.HEIC", 33)
+        with open(os.path.join(media.deriv_dir(still["key"]), now["kf"], "m.webp"), "r+b") as f:
+            f.truncate(100)                         # what a power cut can leave
+        found = library.verify()
+        self.assertEqual(found["damaged"], 1)
+        convert_everything()
+        self.assertNotIn("kf", item_named("IMG_8001.HEIC"), "the still is shown again, not a broken picture")
+        self.assertEqual(library.verify()["damaged"], 0, "and nothing is found again next time")
+        self.assertEqual(c.get(f"/api/admin/key-photo/{still['id']}").get_json()["chosen"], None)
+        self.assertRegex(self.choose(c, "IMG_8001.HEIC", 33)["kf"], r"^k-", "the moment can be chosen again")
+
+    def test_a_live_photo_whose_clip_was_not_kept_is_cut_from_its_small_copy(self):
+        # Converted by a version that kept the small copy of the clip only.
+        c = self.admin()
+        still = item_named("IMG_8001.HEIC")
+        kept = os.path.join(media.deriv_dir(still["key"]), "clip.mov")
+        aside = kept + ".aside"
+        os.rename(kept, aside)
+        try:
+            choices = c.get(f"/api/admin/key-photo/{still['id']}").get_json()
+            self.assertEqual((choices["from"], choices["size"]), ("copy", [1440, 1080]))
+            now = self.choose(c, "IMG_8001.HEIC", 5)
+            self.assertEqual((now["key_photo"]["from"], now["w"], now["h"]), ("copy", 1440, 1080))
+        finally:
+            os.rename(aside, kept)
+
+    def test_with_the_full_size_files_kept_the_clip_is_cut_where_it_lies(self):
+        config.KEEP_ORIGINALS = True
+        folder = os.path.join(config.MEDIA_DIR, "Visible", "Kept")
+        fixtures.photo(os.path.join(folder, "IMG_8004.HEIC"), 2016, 1512, "kept")
+        clip = fixtures.video(os.path.join(folder, "IMG_8004.MOV"), 640, 480, 2)
+        convert_everything()
+        c = self.admin()
+        still = item_named("IMG_8004.HEIC")
+        self.assertFalse([n for n in os.listdir(media.deriv_dir(still["key"])) if n.startswith("clip.")])
+        self.assertEqual(c.get(f"/api/admin/key-photo/{still['id']}").get_json()["from"], "clip")
+        self.assertEqual(self.choose(c, "IMG_8004.HEIC", 8)["key_photo"]["from"], "clip")
+        self.assertTrue(os.path.exists(clip), "and it is left where it is")
 
 
 class TestUploads(unittest.TestCase):

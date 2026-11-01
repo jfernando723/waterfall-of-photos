@@ -53,9 +53,12 @@ CSP = ("default-src 'self'; img-src 'self' data:; media-src 'self' blob:; "
 
 YEAR = 31536000
 _KEY = re.compile(r"^[0-9a-f]{24}$")
-_PHOTO = re.compile(r"^[tml]\.webp$")
+# A photo's three sizes; for a Live Photo shown by a moment of its clip, the
+# three sizes of that moment, in a folder named for what is in it.
+_PHOTO = re.compile(r"^(k-[0-9a-f]{12}/)?[tml]\.webp$")
 _PREVIEW = "p.mp4"
-_LIVE = "live.mp4"                   # the moving half of a Live Photo
+_LIVE = "live.mp4"                   # the moving half of a Live Photo, made for playing.
+                                     # The camera's own clip kept beside it is never served.
 _RUNG = re.compile(r"^v/(\d{3,4})\.(m3u8|m4s)$")
 
 
@@ -449,6 +452,41 @@ def admin_tag():
     if now is None:
         return jsonify(error="Not found."), 404
     return jsonify(tags=now)
+
+
+@app.get("/api/admin/key-photo/<int:item_id>")
+@need("admin")
+def admin_key_photo_choices(item_id: int):
+    """The moments a Live Photo's key photo can be chosen from."""
+    try:
+        found = library.key_photo_choices(item_id)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except media.MediaError as exc:
+        return jsonify(error=str(exc)), 500
+    if found is None:
+        return jsonify(error="Not found."), 404
+    return jsonify(found)
+
+
+@app.post("/api/admin/key-photo")
+@need("admin")
+def admin_key_photo():
+    """Show a Live Photo by one moment of its clip, or (frame: null) by its
+    still again. Nothing of the still's own copies changes either way."""
+    body = request.get_json(silent=True) or {}
+    item_id, frame = body.get("id"), body.get("frame")
+    if type(item_id) is not int or (frame is not None and type(frame) is not int):
+        return jsonify(error="Bad request."), 400
+    try:
+        now = library.choose_key_photo(item_id, frame)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except media.MediaError as exc:
+        return jsonify(error=str(exc)), 500
+    if now is None:
+        return jsonify(error="Not found."), 404
+    return jsonify(now)
 
 
 @app.post("/api/admin/passwords")
