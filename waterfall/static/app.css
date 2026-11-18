@@ -179,6 +179,16 @@ input[type="password"], input[type="text"] {
         -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
 .pill.live { flex: none; font-size: 11px; letter-spacing: 0.08em; padding: 5px 9px; }
 .pill.live.on { background: var(--text); color: #000; }
+/* The auto-scroll, running: tap to stop it. Its fill is how far through this
+   item's time it is, and it breathes while it waits for the next to arrive. */
+.pill.auto { position: relative; flex: none; display: inline-flex; align-items: center; gap: 5px;
+             padding: 5px 11px 5px 9px; }
+.pill.auto i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: rgba(255, 255, 255, 0.24);
+               transition: width 0.25s linear; }
+.pill.auto svg, .pill.auto span { position: relative; }
+.pill.auto svg { width: 11px; height: 11px; fill: currentColor; stroke: none; }
+.pill.auto.waiting i { animation: breathe 1.6s ease-in-out infinite; }
+@keyframes breathe { 50% { opacity: 0.35; } }
 .time { flex: none; font-size: 12px; font-variant-numeric: tabular-nums; pointer-events: none;
         text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); }
 #viewer.zooming .foot { opacity: 0; pointer-events: none; }
@@ -254,6 +264,11 @@ button.tag.add { padding: 4px 11px; color: var(--muted); border: 1px dashed var(
 .option select { flex: 1; min-width: 0; max-width: 62%; padding: 8px 10px; border-radius: 9px; font: inherit;
                  color: var(--text); background: var(--bg); border: 1px solid var(--line); }
 .plain.primary-ish { background: var(--text); color: #000; }
+.sheet .option input[type="number"] { width: 84px; margin: 0; padding: 8px 10px; font: inherit; text-align: center;
+                                      color: var(--text); background: var(--bg); border: 1px solid var(--line);
+                                      border-radius: 9px; }
+.check { display: flex; align-items: center; gap: 10px; padding: 9px 0; cursor: pointer; }
+.sheet .check input { width: 20px; height: 20px; margin: 0; flex: none; accent-color: var(--accent); }
 details.more { margin-top: 14px; color: var(--muted); font-size: 14px; }
 details.more summary { cursor: pointer; padding: 6px 0; }
 /* The upload, on the wall, for when the sheet is closed. */

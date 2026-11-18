@@ -28,6 +28,7 @@ import hashlib
 import http.client
 import io
 import json
+import math
 import os
 import re
 import resource
@@ -1167,6 +1168,102 @@ class TestHTTP(unittest.TestCase):
         self.assertEqual(js.count("'t.webp'") + js.count("'l.webp'"), 0)
         self.assertEqual(js.count("'m.webp'"), 1, "a video's poster only, which no key photo replaces")
         self.assertGreaterEqual(js.count("photoUrl("), 8)
+
+    def test_only_the_admin_can_start_the_auto_scroll_and_its_moves_are_nobodys_touch(self):
+        # Asked for outright: the auto-scroll is the admin's to
+        # start, and when the admin's half hour runs out it carries on on the
+        # Visible wall and stops on the Hidden one. No test here can watch it
+        # run (scripts/browsers/auto-scroll.py does, in a real browser); this
+        # keeps the pieces that carry those promises from being undone.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        panel = js[js.index("function adminPanel(body)"):js.index("async function renderStatus(")]
+        self.assertIn("body.appendChild(autoPanel());", panel)
+        self.assertEqual(js.count("autoPanel()"), 2, "made in the admin's menu and nowhere else")
+        self.assertEqual(js.count("'Start auto-scroll'"), 1)
+        self.assertEqual(js.count("startAuto("), 2, "declared once and called from that menu once")
+        start = js[js.index("function startAuto(index)"):js.index("function stopAuto()")]
+        self.assertIn("if (!isAdmin()", start)
+        # Leaving the viewer, however it is left (Back, a section, the other
+        # wall, the gate), stops it.
+        close = js[js.index("function closeViewer(silent)"):js.index("function pushHistory()")]
+        self.assertIn("stopAuto();", close)
+        # Its own moves do not renew the admin's sign-in...
+        note = js[js.index("function noteActivity(event)"):js.index("let leaving = false;")]
+        self.assertIn("event.type === 'scroll' && performance.now() < auto.quietUntil", note)
+        self.assertIn("auto.quietUntil = performance.now() +", js)
+        section = js[js.index("// ----------------------------------------------------------- auto-scroll --"):
+                     js.index("// -------------------------------------------------------------- sheets --")]
+        self.assertNotIn("noteActivity", section)
+        self.assertNotIn("/api/admin/touch", section)
+        self.assertNotIn("lastActive", section)
+        # ...and when it runs out, only the Visible wall carries on.
+        idle = js[js.index("async function leaveAdminIfIdle()"):js.index("setInterval(leaveAdminIfIdle")]
+        self.assertIn("else if (auto.running && state.realm === 'visible' && $('sheet').hidden) return;", idle)
+        self.assertIn("else await setRealm('visible');", idle)
+        realm = js[js.index("async function setRealm(realm)"):js.index("const places = {")]
+        self.assertIn("closeViewer(true)", realm, "putting the wall back closes the viewer, which stops it")
+
+    def test_nobody_but_the_admin_sees_any_sign_of_the_auto_scroll(self):
+        # Asked for outright: for anyone not signed in as the admin the page
+        # does not change at all. The HTML everyone is sent says nothing of it;
+        # its button is made by the script only once the admin starts it, and
+        # shown only while the admin is signed in (once the sign-in runs out on
+        # the Visible wall it carries on with nothing on the screen); and its
+        # settings are stored apart, only when the admin changes one.
+        html = self.client().get("/").get_data(as_text=True)
+        self.assertNotRegex(html, r"(?i)auto-?scroll|viewer-auto|pill auto|>Auto<")
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        defaults = js[js.index("const DEFAULTS = {"):js.index("const prefs =")]
+        self.assertNotRegex(defaults, r"(?i)\bauto[A-Z]?\w*:")
+        self.assertNotRegex(js, r"prefs\.auto|prefs\[key\]", "the auto-scroll's settings are not everyone's")
+        draw = js[js.index("function drawAuto()"):js.index("// \"Slow pan and zoom on photos\"")]
+        self.assertIn("if (!autoPillMade && !(auto.running && isAdmin())) return;", draw)
+        self.assertIn("pill.hidden = !auto.running || !isAdmin();", draw)
+        self.assertEqual(js.count("autoPill()"), 2, "made in one place, asked for from drawAuto only")
+
+    def test_the_auto_scroll_finishes_the_play_under_way_and_waits_for_the_best_copy(self):
+        # Asked for: a video shorter than the time plays again until the
+        # time is up, and the play under way then is finished (five minutes and
+        # a two-minute video: three plays); a longer one plays once. "Wait for
+        # full quality" asks for the best copy there is.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        plays = js[js.index("function neededPlays(video)"):js.index("function autoEnded(")]
+        self.assertIn("Math.max(1, Math.ceil(autoMs() / 1000 / length - 0.05))", plays)
+        # The same arithmetic, here, on the owner's examples and on the slack it allows.
+        needed = lambda minutes, length: max(1, math.ceil(minutes * 60 / length - 0.05))
+        self.assertEqual(needed(5, 120), 3)
+        self.assertEqual(needed(5, 60), 5)
+        self.assertEqual(needed(5, 60.03), 5)
+        self.assertEqual(needed(5, 59.97), 5)
+        self.assertEqual(needed(1, 600), 1, "longer than the time: once, whole")
+        self.assertEqual(js.count("autoMinutes() * 60000"), 1, "whole minutes, as asked")
+        build = js[js.index("function buildSlide(index)"):js.index("const mainVideo =")]
+        self.assertIn("const size = autoFull() ? topRung(item) : 'auto';", build)
+        self.assertIn("const size = prefs.photoHigh || autoFull() ? 'l' : 'm';", build)
+        self.assertIn("const autoFull = () => auto.running && autoPrefs.wait;", js)
+        # A video waited for is ready once its first ten seconds are here: a
+        # browser fetches no further ahead of a paused video and never calls it
+        # ready to play through (seen in Chrome: twelve seconds, then nothing).
+        self.assertIn("if (video.readyState >= 3 && have >= Math.min(10, length) - 0.25) return true;", js)
+        # And beyond that, asked for: the whole of the next video fetched into
+        # memory and played from there, at its top size, up to 150 MB, only
+        # while waiting for full quality; at most two held, each let go of with
+        # its slide; a larger one, or one that will not play, the ordinary way.
+        fetch = js[js.index("function fetchWhole()"):js.index("function autoNext()")]
+        self.assertIn("if (!autoFull() || !item || item.k !== 'v' || !video || video.dataset.whole) return;", fetch)
+        self.assertIn("fetch(murl(item, `v/${topRung(item)}.m4s`), { signal: ctrl.signal })", fetch)
+        self.assertIn("size > WHOLE_MAX", fetch)
+        self.assertIn("const WHOLE_MAX = 150e6;", js)
+        self.assertIn("plainSource(item);", fetch)
+        self.assertIn("if (video.dataset.whole) return true;", js)
+        drop = js[js.index("function dropSlide(index)"):js.index("function renderWindow()")]
+        self.assertIn("letGoWhole(video);", drop)
+        begin = js[js.index("function autoBegin(index)"):js.index("function neededPlays(video)")]
+        self.assertIn("if (i === index || i === index + 1 || !held || !held.dataset.whole) continue;", begin)
+        stop = js[js.index("function stopAuto()"):js.index("function autoBegin(index)")]
+        self.assertIn("stopWhole();", stop)
+        # Never stuck for good: at most one more turn of the time.
+        self.assertIn("if (!autoPrefs.wait || auto.shown - auto.doneAt >= autoMs()) return true;", js)
 
     def test_the_admin_page_is_told_what_a_look_found_and_what_a_check_found(self):
         c = self.client(ADMIN)

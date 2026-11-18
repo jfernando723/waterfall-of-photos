@@ -55,6 +55,10 @@
   };
   function newSeed() { return 1 + Math.floor(Math.random() * 2147483000); }
   const isAdmin = () => !!(state.me && state.me.admin);
+  // The auto-scroll (see "auto-scroll", below). Kept up here because the
+  // admin's clock, next, has to tell its moves from a person's.
+  const auto = { running: false, quietUntil: 0, last: 0, shown: 0, plays: 0, done: false, doneAt: 0,
+                 moving: false, userPaused: false, progressAt: 0, warmed: null };
 
   // -------------------------------------------------------- link measure --
   // The phone already downloads images constantly, so it can time them
@@ -165,7 +169,9 @@
   let lastActive = Date.now();
   let lastRenewed = Date.now();
   const idleLimit = () => ((state.me && state.me.admin_idle) || 1800) * 1000;
-  function noteActivity() {
+  function noteActivity(event) {
+    // The auto-scroll moving on scrolls the viewer, and that is nobody's touch.
+    if (event && event.type === 'scroll' && performance.now() < auto.quietUntil) return;
     lastActive = Date.now();
     if (isAdmin() && lastActive - lastRenewed > 120000) {
       lastRenewed = lastActive;
@@ -182,7 +188,12 @@
     try {
       await api('/api/logout', {}).catch(() => {});
       await refreshMe().catch(() => {});
-      if (!state.me || !state.me.role) showGate(); else await setRealm('visible');
+      if (!state.me || !state.me.role) showGate();
+      // An auto-scroll on the Visible wall carries on (the owner's choice): that
+      // wall is anyone's to see. Anywhere else the wall is put back as ever,
+      // which on the Hidden one closes the viewer and so stops it.
+      else if (auto.running && state.realm === 'visible' && $('sheet').hidden) return;
+      else await setRealm('visible');
     } finally { leaving = false; }
   }
   setInterval(leaveAdminIfIdle, 15000);
@@ -681,15 +692,27 @@
       video.loop = true;
       video.poster = murl(item, 'm.webp');
       video.preload = 'metadata';
-      video.src = videoSource(item);
-      slide.dataset.size = 'auto';
+      // The auto-scroll waiting for full quality shows the best copy there is
+      // and nothing less; otherwise the size follows the link.
+      const size = autoFull() ? topRung(item) : 'auto';
+      video.src = videoSource(item, size);
+      slide.dataset.size = size;
       const spinner = el('div', 'spinner');
       spinner.hidden = true;
       video.addEventListener('waiting', () => { spinner.hidden = false; });
       video.addEventListener('playing', () => { spinner.hidden = true; slide.classList.remove('is-paused'); });
-      video.addEventListener('pause', () => { if (index === state.current) slide.classList.add('is-paused'); });
-      video.addEventListener('timeupdate', () => { if (index === state.current) showTime(video); });
+      video.addEventListener('pause', () => {
+        // A play ending under the auto-scroll is played again, or moved on
+        // from, at once: no play button for that moment.
+        if (index === state.current && !(auto.running && video.ended)) slide.classList.add('is-paused');
+      });
+      video.addEventListener('timeupdate', () => {
+        if (index !== state.current) return;
+        showTime(video);
+        auto.progressAt = performance.now();
+      });
       video.addEventListener('loadedmetadata', () => { if (index === state.current) showTime(video); });
+      video.addEventListener('ended', () => autoEnded(index, video));     // only while the auto-scroll runs: loop is off then
       const paused = el('div', 'paused');
       paused.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
       slide.append(video, spinner, paused);
@@ -705,8 +728,9 @@
       sharp.draggable = false;
       sharp.decoding = 'async';
       sharp.addEventListener('load', () => sharp.classList.add('in'), { once: true });
-      sharp.src = photoUrl(item, prefs.photoHigh ? 'l' : 'm');
-      slide.dataset.size = prefs.photoHigh ? 'l' : 'm';
+      const size = prefs.photoHigh || autoFull() ? 'l' : 'm';
+      sharp.src = photoUrl(item, size);
+      slide.dataset.size = size;
       slide.classList.add('photo');
       const layer = el('div', 'zoom');       // what pinching scales and dragging moves
       layer.append(low, sharp);
@@ -726,6 +750,7 @@
     // (it allows few).
     for (const video of slide.querySelectorAll('video')) {
       video.pause(); video.removeAttribute('src'); video.load();
+      letGoWhole(video);                // a whole video held in memory goes with it
     }
     slide.remove();
     slides.delete(index);
@@ -774,7 +799,7 @@
       warmed.add(item.id);
       // For a photo this is the whole picture. For a video it is the poster:
       // the swipe lands on a sharp still while the first seconds arrive.
-      new Image().src = photoUrl(item, item.k === 'v' || !prefs.photoHigh ? 'm' : 'l');
+      new Image().src = photoUrl(item, item.k === 'v' || !(prefs.photoHigh || autoFull()) ? 'm' : 'l');
     }
     // The very next video also starts buffering, so it plays the moment it
     // is reached. Only one, so a quick flick past it wastes little.
@@ -812,6 +837,7 @@
     $('scrub-fill').style.width = '0';
     preloadAhead();
     if (index > state.items.length - 8) loadMore();
+    if (auto.running) autoBegin(index);     // whoever moved, the auto-scroll or a swipe: the time starts again
   }
 
   // How far into the video, and how long it is, in a few characters.
@@ -855,6 +881,7 @@
     if (!slide || !video || !item) return;
     const at = video.currentTime;
     slide.dataset.size = choice;
+    letGoWhole(video);
     video.src = videoSource(item, choice);
     video.addEventListener('loadedmetadata', () => {
       try { video.currentTime = at; } catch { /* starts from the beginning instead */ }
@@ -1074,6 +1101,7 @@
 
   function closeViewer(silent) {
     if (!state.viewing) return;
+    stopAuto();
     closeKeyer();
     resetZoom(false);
     state.viewing = false;
@@ -1140,6 +1168,7 @@
     zoom.layer.style.transform = zoom.s === 1 ? '' : `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.s})`;
   }
   function holdDeck(held) {
+    if (held && zoom.slide) stopDrift(zoom.slide, true);     // the fingers take over from the slow pan
     deck.classList.toggle('held', held);
     $('viewer').classList.toggle('zooming', held);
     if (zoom.slide) zoom.slide.classList.toggle('zoomed', held);
@@ -1287,6 +1316,8 @@
     const video = mainVideo(event.target.closest('.slide'));
     const slide = video && video.closest('.slide');
     if (!video) return;
+    // A video paused by a tap holds the auto-scroll until it is tapped again.
+    auto.userPaused = !video.paused;
     if (video.paused) playCurrent(video, slide);
     else video.pause();
   });
@@ -1348,6 +1379,423 @@
     else if (event.key === 'i') $('viewer-info').click();
     else if (event.key === 'm') $('viewer-sound').click();
   });
+
+  // ----------------------------------------------------------- auto-scroll --
+  // The viewer moving on by itself, so many whole minutes on each item. Only
+  // the admin can start it (asked for outright), from the admin menu; anyone
+  // can stop it, with its pill or by leaving the viewer.
+  //
+  // A video shorter than the time plays again until the time is up, and the
+  // play under way when it runs out is finished: five minutes and a two-minute
+  // video is three plays. A video longer than the time plays once, whole.
+  //
+  // "Wait for full quality" shows every item at the best copy it has (a
+  // photo's large copy, a video's top size) and stays on the item before until
+  // the next has arrived: a photo whole, a video's first ten seconds. Never
+  // for longer than one more turn of the time: a phone that never says a
+  // video is ready must not stop the whole thing.
+  // Unticked, it moves on when the time is up, at whatever has arrived.
+  //
+  // Anything a person does holds it: a sheet open, a photo zoomed, a video
+  // paused by a tap, choosing a key photo, or the page out of sight. A swipe
+  // moves on and starts the time again. Its own moves are not a touch, so the
+  // admin's half hour runs out as it would on a phone left alone: then it
+  // carries on on the Visible wall and stops on the Hidden one, which goes.
+  let autoTimer = 0;
+  const drifts = new WeakMap();        // slide -> its slow pan and zoom
+  // Its settings are kept apart from everyone's and written down only when
+  // the admin changes one, so nothing of it is stored on anybody else's device.
+  const AUTO_STORE = 'waterfall.auto';
+  const autoPrefs = Object.assign({ minutes: 1, wait: true, pan: false }, (() => {
+    try { return JSON.parse(localStorage.getItem(AUTO_STORE) || '{}'); } catch { return {}; }
+  })());
+  const saveAuto = () => {
+    try { localStorage.setItem(AUTO_STORE, JSON.stringify(autoPrefs)); } catch { /* private tab */ }
+  };
+  const autoFull = () => auto.running && autoPrefs.wait;
+  const autoMinutes = () => { const m = Number(autoPrefs.minutes); return m > 0 ? m : 1; };
+  const autoMs = () => autoMinutes() * 60000;
+  const topRung = (item) => String(Math.max(...(item.r || ['360']).map(Number)));
+  const autoHeld = () => document.hidden || !sheet.hidden || !!keyer.slide
+    || (zoom.slide !== null && zoom.s > 1) || auto.userPaused;
+
+  function startAuto(index) {
+    if (!isAdmin() || index < 0 || index >= state.items.length) return;
+    closeViewer(true);
+    auto.running = true;
+    keepAwake(true);
+    openViewer(index);                  // the deck is made afresh, at the quality asked for
+    clearInterval(autoTimer);
+    autoTimer = setInterval(autoTick, 250);
+    drawAuto();
+  }
+
+  function stopAuto() {
+    if (!auto.running) return;
+    auto.running = false;
+    clearInterval(autoTimer);
+    keepAwake(false);
+    stopWhole();
+    for (const slide of slides.values()) {
+      stopDrift(slide, false);          // a photo stays as it was at that moment
+      const video = mainVideo(slide);
+      if (video) video.loop = true;
+    }
+    drawAuto();
+  }
+
+  // A new item on screen, by the auto-scroll or by a swipe.
+  function autoBegin(index) {
+    const now = performance.now();
+    Object.assign(auto, { last: now, shown: 0, plays: 0, done: false, doneAt: 0, moving: false,
+                          userPaused: false, progressAt: now, warmed: null });
+    for (const [i, slide] of slides) if (i !== index) stopDrift(slide, true);
+    const slide = slides.get(index);
+    const video = mainVideo(slide);
+    if (video) video.loop = false;      // it is played again here, so that the plays can be counted
+    else if (slide && autoPrefs.pan) startDrift(slide);
+    // At most two whole videos held in memory: the one on screen and the next.
+    for (const [i, other] of slides) {
+      const held = mainVideo(other);
+      if (i === index || i === index + 1 || !held || !held.dataset.whole) continue;
+      letGoWhole(held);
+      held.preload = 'metadata';        // nothing more of it fetched unless it is swiped back to
+      held.src = videoSource(state.items[i], other.dataset.size);
+    }
+    fetchWhole();
+    drawAuto();
+  }
+
+  // How many times the video on screen plays in the time.
+  function neededPlays(video) {
+    const item = state.items[state.current];
+    const length = video && isFinite(video.duration) && video.duration > 0 ? video.duration : (item && item.d) || 0;
+    // A twentieth of a play's slack: a "one-minute" video of 60.03 seconds
+    // still plays five times in five minutes, not six.
+    return length ? Math.max(1, Math.ceil(autoMs() / 1000 / length - 0.05)) : 1;
+  }
+
+  function autoEnded(index, video) {
+    if (!auto.running || index !== state.current) return;
+    auto.plays += 1;
+    auto.progressAt = performance.now();
+    if (!auto.done && auto.plays >= neededPlays(video)) { auto.done = true; auto.doneAt = auto.shown; }
+    if (auto.done && !autoHeld() && autoMayMove()) return autoNext();
+    // Due to play again, or waiting for the next item: from the start.
+    try { video.currentTime = 0; } catch { /* not seekable yet */ }
+    video.play().catch(() => {});
+  }
+
+  function autoTick() {
+    const now = performance.now();
+    const elapsed = Math.min(now - auto.last, 1000);  // a phone's timers sleep with it
+    auto.last = now;
+    if (!auto.running) return;
+    const held = autoHeld();
+    const drift = drifts.get(slides.get(state.current));
+    if (drift && held && drift.playState === 'running') drift.pause();
+    else if (drift && !held && drift.playState === 'paused') drift.play();
+    if (held) return drawAuto();
+    auto.shown += elapsed;
+    if (!auto.done) {
+      const video = currentVideo();
+      // A photo: the time. A video: its plays (autoEnded), or, once the time is
+      // up, half a minute without moving (refused, or stuck on the way).
+      if (!video ? auto.shown >= autoMs() : auto.shown >= autoMs() && now - auto.progressAt > 30000) {
+        auto.done = true;
+        auto.doneAt = auto.shown;
+      }
+    }
+    if (auto.done && autoMayMove()) autoNext();
+    drawAuto();
+  }
+
+  // The item after this one; at the end, the first again. -1: still loading.
+  function autoNextIndex() {
+    if (state.current + 1 < state.items.length) return state.current + 1;
+    if (state.more) { loadMore(); return -1; }
+    return 0;
+  }
+
+  function autoMayMove() {
+    if (auto.moving || autoNextIndex() < 0) return false;
+    if (!autoPrefs.wait || auto.shown - auto.doneAt >= autoMs()) return true;
+    const slide = slides.get(autoNextIndex());
+    if (!slide) return true;            // round again to the start: not in the deck yet
+    const video = mainVideo(slide);
+    if (!video) {
+      const sharp = slide.querySelector('img.sharp');
+      return !sharp || sharp.complete;  // arrived, or failed: either way nothing more is coming
+    }
+    if (video.dataset.whole) return true;                    // all of it is here, in memory
+    if (whole.state === 'loading' && whole.item === state.items[Number(slide.dataset.index)]) return false;
+    if (video.error || video.readyState >= 4) return true;
+    // A browser fetches only so far ahead of a video that is not playing
+    // (Chrome: twelve seconds, then it stops) and never calls it ready to play
+    // through while it waits. So a video is ready once its first ten seconds,
+    // or all of it if it is shorter, are here at the size asked for.
+    const length = isFinite(video.duration) && video.duration > 0 ? video.duration : 10;
+    const have = video.buffered.length && video.buffered.start(0) <= 0.5 ? video.buffered.end(0) : 0;
+    if (video.readyState >= 3 && have >= Math.min(10, length) - 0.25) return true;
+    if (auto.warmed !== video) {
+      // A phone may fetch nothing of a video until it is asked to play it: a
+      // moment's silent play, out of sight, starts it coming.
+      auto.warmed = video;
+      video.preload = 'auto';
+      video.muted = true;
+      const attempt = video.play();
+      if (attempt && attempt.then) {
+        attempt.then(() => {
+          if (Number(slide.dataset.index) === state.current) return;
+          video.pause();
+          try { video.currentTime = 0; } catch { /* starts where it stopped */ }
+        }).catch(() => {});
+      }
+    }
+    return false;
+  }
+
+  // "Wait for full quality", for a video, goes further than any browser
+  // will by itself: the whole of the next video, at its top size, is fetched
+  // into memory while this item is on screen, and played from there, so none
+  // of it is left to arrive. Left to itself a browser fetches only so far
+  // ahead of a video that is not playing (Chrome twelve seconds; Safari on a
+  // Mac all of it; an iPhone, not known). Up to 150 MB, two to five minutes
+  // at 1440p: a larger one, or one a phone will not play this way, waits for
+  // its first ten seconds instead. At most two are held, the one on screen
+  // and the next; any other goes back to being fetched as it plays.
+  const WHOLE_MAX = 150e6;
+  const whole = { item: null, ctrl: null, state: '' };
+
+  function letGoWhole(video) {
+    if (!video || !video.dataset.whole) return;
+    URL.revokeObjectURL(video.dataset.whole);
+    delete video.dataset.whole;
+  }
+
+  // The video's ordinary source again, after a download that stopped, was too
+  // large or would not play; and playing, if it is the one on screen.
+  function plainSource(item) {
+    const index = state.items.indexOf(item);
+    const slide = slides.get(index);
+    const video = mainVideo(slide);
+    if (!video || video.getAttribute('src')) return;
+    video.src = videoSource(item, slide.dataset.size);
+    video.preload = 'auto';
+    if (index === state.current) playCurrent(video, slide);
+  }
+
+  function stopWhole() {
+    const { item, ctrl, state: was } = whole;
+    Object.assign(whole, { item: null, ctrl: null, state: '' });
+    if (ctrl) ctrl.abort();
+    if (item && was === 'loading') plainSource(item);
+  }
+
+  function fetchWhole() {
+    const index = state.current + 1;
+    const item = state.items[index];
+    if (item && whole.item === item) return;           // on its way, or here already
+    stopWhole();
+    const video = mainVideo(slides.get(index));
+    if (!autoFull() || !item || item.k !== 'v' || !video || video.dataset.whole) return;
+    const ctrl = new AbortController();
+    Object.assign(whole, { item, ctrl, state: 'loading' });
+    // The video's own loading would race the download for the same bytes.
+    video.preload = 'none';
+    video.removeAttribute('src');
+    video.load();
+    (async () => {
+      const response = await fetch(murl(item, `v/${topRung(item)}.m4s`), { signal: ctrl.signal });
+      const size = Number(response.headers.get('Content-Length')) || 0;
+      if (!response.ok || !size || size > WHOLE_MAX) throw new Error('not fetched whole');
+      const blob = await response.blob();
+      if (whole.item !== item) return;
+      const into = mainVideo(slides.get(state.items.indexOf(item)));
+      if (!into) throw new Error('no longer in the deck');
+      into.dataset.whole = URL.createObjectURL(blob);
+      into.addEventListener('error', () => {
+        if (!into.dataset.whole) return;
+        letGoWhole(into);
+        into.removeAttribute('src');
+        plainSource(item);
+      }, { once: true });
+      into.src = into.dataset.whole;
+      into.preload = 'auto';
+      whole.state = 'done';
+    })().catch(() => {
+      if (whole.item !== item) return;
+      ctrl.abort();
+      whole.state = 'skip';
+      plainSource(item);
+    });
+  }
+
+  function autoNext() {
+    const next = autoNextIndex();
+    if (next < 0) return;
+    auto.quietUntil = performance.now() + 1500;
+    if (next === state.current) {       // one item only: round again
+      const video = currentVideo();
+      autoBegin(next);
+      if (video) { try { video.currentTime = 0; } catch { /* from where it is */ } video.play().catch(() => {}); }
+      return;
+    }
+    auto.moving = true;
+    if (next !== state.current + 1) return setCurrent(next);
+    const from = state.current;
+    step(1);                            // as a swipe would
+    // Should the scroll not land (a browser that sends no scroll events), go there outright.
+    setTimeout(() => { if (auto.running && state.current === from) setCurrent(next); }, 1200);
+  }
+
+  // The pill: tapping it stops the auto-scroll; its fill is how far through
+  // this item the time is, and it breathes while waiting for the next.
+  //
+  // Nobody but the admin is to see any sign of the auto-scroll (asked for
+  // outright). So the pill is not in the page's HTML: it is made here, the
+  // first time the admin starts one, and shown only while the admin is
+  // signed in. Once the sign-in runs out on the Visible wall the auto-scroll
+  // carries on with nothing on the screen to show it; Back stops it, as it
+  // closes any viewer.
+  let autoPillMade = null;
+  function autoPill() {
+    if (autoPillMade) return autoPillMade;
+    const pill = autoPillMade = el('button', 'pill auto');
+    pill.setAttribute('aria-label', 'Stop auto-scroll');
+    pill.innerHTML = '<i></i><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>'
+      + '<span>Auto</span>';
+    pill.addEventListener('click', stopAuto);
+    document.querySelector('#viewer .foot').prepend(pill);
+    return pill;
+  }
+  function drawAuto() {
+    if (!autoPillMade && !(auto.running && isAdmin())) return;
+    const pill = autoPill();
+    pill.hidden = !auto.running || !isAdmin();
+    if (pill.hidden) return;
+    const video = currentVideo();
+    let part = auto.shown / autoMs();
+    if (video && isFinite(video.duration) && video.duration > 0) {
+      part = (auto.plays + video.currentTime / video.duration) / neededPlays(video);
+    }
+    pill.classList.toggle('waiting', auto.done);
+    pill.firstChild.style.width = Math.round(clamp(auto.done ? 1 : part, 0, 1) * 100) + '%';
+  }
+
+  // "Slow pan and zoom on photos": over the item's time the photo creeps
+  // twelve per cent closer to a corner, or back out from one, never so far as
+  // to show its edge. The fingers take over the moment a photo is pinched.
+  // An animation made here, not in app.css, so a phone set to reduce motion
+  // still does what the box asks.
+  function startDrift(slide) {
+    const layer = slide.querySelector('.zoom');
+    if (!layer || !layer.animate) return;
+    stopDrift(slide, true);
+    const s = 1.12;
+    const x = (-Math.random() * (s - 1) * 100).toFixed(2), y = (-Math.random() * (s - 1) * 100).toFixed(2);
+    const near = { transform: 'translate(0%, 0%) scale(1)' };
+    const far = { transform: `translate(${x}%, ${y}%) scale(${s})` };
+    drifts.set(slide, layer.animate(Math.random() < 0.5 ? [near, far] : [far, near],
+                                    { duration: autoMs(), easing: 'linear', fill: 'forwards' }));
+  }
+  function stopDrift(slide, undo) {
+    const drift = slide && drifts.get(slide);
+    if (!drift) return;
+    if (!undo) return drift.pause();
+    drift.cancel();
+    drifts.delete(slide);
+  }
+
+  // A phone locks its screen after a minute or two untouched, and nobody is
+  // meant to touch it. Over https, or on this machine, the page may ask for the
+  // screen to stay on. Over plain http, as at a NAS's address, it may not; a
+  // playing video keeps the screen on all the same, so a tiny blank one (16 by
+  // 16 pixels, two seconds, no sound) plays out of sight, as NoSleep.js does.
+  const AWAKE_MP4 = 'AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMObW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAB9AAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAl10cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAB9AAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAABAAAAAQAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAfQAAAAAAABAAAAAAHVbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAgABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABgG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAUBzdGJsAAAAuHN0c2QAAAAAAAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAABAAEABIAAAASAAAAAAAAAABDExhdmMgbGlieDI2NAAAAAAAAAAAAAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBQsAe/+EAFmdCwB7ZHsBEAAADAAQAAAMAEDxYuSABAAVoy4PLIAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAAACwAAAAAAAAABhzdHRzAAAAAAAAAAEAAAAEAAAgAAAAABRzdHNzAAAAAAAAAAEAAAABAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAAEAAAAAQAAACRzdHN6AAAAAAAAAAAAAAAEAAAADwAAAAoAAAAKAAAACQAAABRzdGNvAAAAAAAAAAEAAAM+AAAAPXVkdGEAAAA1bWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAIaWxzdAAAAAhmcmVlAAAANG1kYXQAAAALZYiEBTyYoAA/v4AAAAAGQZo4CnqAAAAABkGaVAKeoAAAAAVBmmAS9Q==';
+  const awake = { want: false, lock: null, asking: false, video: null };
+  function keepAwake(on) {
+    awake.want = on;
+    if (!on) {
+      if (awake.lock) awake.lock.release().catch(() => {});
+      awake.lock = null;
+      if (awake.video) awake.video.pause();
+      return;
+    }
+    const byVideo = () => {
+      if (!awake.want) return;
+      if (!awake.video) {
+        const video = awake.video = el('video');
+        video.muted = true;
+        video.setAttribute('muted', '');
+        video.playsInline = true;
+        video.setAttribute('playsinline', '');
+        video.disableRemotePlayback = true;
+        video.loop = true;
+        // Never at the end, where a phone might count it as stopped.
+        video.addEventListener('timeupdate', () => { if (video.currentTime > 1) video.currentTime = Math.random() * 0.5; });
+        const bytes = Uint8Array.from(atob(AWAKE_MP4), (c) => c.charCodeAt(0));
+        video.src = URL.createObjectURL(new Blob([bytes], { type: 'video/mp4' }));
+      }
+      awake.video.play().catch(() => {});
+    };
+    if (!navigator.wakeLock) return byVideo();     // asked for inside the tap that started it
+    if (awake.asking || (awake.lock && !awake.lock.released)) return;
+    awake.asking = true;
+    navigator.wakeLock.request('screen').then((lock) => {
+      awake.asking = false;
+      if (awake.want) awake.lock = lock; else lock.release().catch(() => {});
+    }).catch(() => { awake.asking = false; byVideo(); });
+  }
+  // Out of sight the browser lets go of the screen; looked at again, ask again.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && auto.running) keepAwake(true); });
+
+  // The admin menu's part: the time, the two boxes, and Start. Kept to that
+  // on purpose: the owner asked for a simple, clean menu.
+  function autoPanel() {
+    const box = el('div');
+    const minutes = el('input');
+    minutes.type = 'number';
+    minutes.min = '1';
+    minutes.max = '999';
+    minutes.step = '1';
+    minutes.inputMode = 'numeric';
+    minutes.setAttribute('aria-label', 'Minutes on each item');
+    minutes.value = String(Math.max(1, Math.round(autoMinutes())));
+    const keep = () => {
+      const m = Math.round(Number(minutes.value));
+      if (m >= 1 && m !== autoPrefs.minutes) { autoPrefs.minutes = Math.min(999, m); saveAuto(); }
+      minutes.value = String(Math.max(1, Math.round(autoMinutes())));
+    };
+    minutes.addEventListener('change', keep);
+    box.appendChild(option('Minutes on each item', minutes));
+    box.appendChild(tickBox('Wait for full quality', 'wait'));
+    box.appendChild(tickBox('Slow pan and zoom on photos', 'pan'));
+    const go = el('button', 'plain primary-ish', 'Start auto-scroll');
+    const note = el('p', 'error');
+    go.addEventListener('click', () => {
+      keep();
+      const index = tileNearTop();
+      if (index < 0) { note.textContent = 'There is nothing on this wall to show.'; return; }
+      keepAwake(true);                  // inside the tap: a phone lets a clip start only then
+      const begin = () => startAuto(index);
+      if (!pushed) { closeSheet(); return begin(); }
+      // The menu closes as Back closes it, and the viewer opens after that.
+      window.addEventListener('popstate', () => setTimeout(begin, 0), { once: true });
+      history.back();
+    });
+    box.append(go, note);
+    return box;
+  }
+  function tickBox(label, key) {
+    const row = el('label', 'check');
+    const box = el('input');
+    box.type = 'checkbox';
+    box.checked = !!autoPrefs[key];
+    box.addEventListener('change', () => { autoPrefs[key] = box.checked; saveAuto(); });
+    row.append(box, el('span', '', label));
+    return row;
+  }
 
   // -------------------------------------------------------------- sheets --
   const sheet = $('sheet');
@@ -1768,6 +2216,9 @@
     body.appendChild(el('p', 'muted small', 'Logging out shows the site as everyone else sees it. The switch below does the same without logging out.'));
     body.appendChild(option('Wall', segmented([['visible', 'Visible'], ['hidden', 'Hidden']],
       state.realm, (realm) => setRealm(realm))));
+
+    body.appendChild(el('h3', '', 'Auto-scroll'));
+    body.appendChild(autoPanel());
 
     body.appendChild(el('h3', '', 'Library'));
     const status = body.appendChild(el('div'));
