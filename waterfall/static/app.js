@@ -691,11 +691,14 @@
       video.muted = true;
       video.loop = true;
       video.poster = murl(item, 'm.webp');
-      video.preload = 'metadata';
-      // The auto-scroll waiting for full quality shows the best copy there is
-      // and nothing less; otherwise the size follows the link.
-      const size = autoFull() ? topRung(item) : 'auto';
-      video.src = videoSource(item, size);
+      // The auto-scroll waiting for full quality shows the best copy that
+      // arrives in time, and fetches nothing of a video ahead but the one it
+      // is fetching whole (see autoSize and wholeInto); otherwise, and for
+      // the video it starts on, which there was no time to fetch, the size
+      // follows the link.
+      const size = autoFull() && (index !== state.current || whole.item === item) ? autoSize(item) : 'auto';
+      video.preload = autoFull() && index !== state.current ? 'none' : 'metadata';
+      if (!wholeInto(video, item)) video.src = videoSource(item, size);
       slide.dataset.size = size;
       const spinner = el('div', 'spinner');
       spinner.hidden = true;
@@ -802,9 +805,10 @@
       new Image().src = photoUrl(item, item.k === 'v' || !(prefs.photoHigh || autoFull()) ? 'm' : 'l');
     }
     // The very next video also starts buffering, so it plays the moment it
-    // is reached. Only one, so a quick flick past it wastes little.
+    // is reached. Only one, so a quick flick past it wastes little. Not while
+    // the auto-scroll waits for full quality: it fetches that one whole.
     const video = mainVideo(slides.get(state.current + 1));
-    if (video && prefs.ahead > 0 && video.preload !== 'auto') {
+    if (video && prefs.ahead > 0 && !autoFull() && video.preload !== 'auto') {
       video.preload = 'auto';
       video.load();
     }
@@ -1389,11 +1393,11 @@
   // play under way when it runs out is finished: five minutes and a two-minute
   // video is three plays. A video longer than the time plays once, whole.
   //
-  // "Wait for full quality" shows every item at the best copy it has (a
-  // photo's large copy, a video's top size) and stays on the item before until
-  // the next has arrived: a photo whole, a video's first ten seconds. Never
-  // for longer than one more turn of the time: a phone that never says a
-  // video is ready must not stop the whole thing.
+  // "Wait for full quality" shows every photo at its large copy and every
+  // video at the best size that arrives in time (the top one when the link
+  // allows: see "fetched whole", below), and stays on the item before until
+  // the next has arrived. Never for longer than one more turn of the time: a
+  // phone that never says a video is ready must not stop the whole thing.
   // Unticked, it moves on when the time is up, at whatever has arrived.
   //
   // Anything a person does holds it: a sheet open, a photo zoomed, a video
@@ -1421,10 +1425,21 @@
 
   function startAuto(index) {
     if (!isAdmin() || index < 0 || index >= state.items.length) return;
-    closeViewer(true);
-    auto.running = true;
-    keepAwake(true);
-    openViewer(index);                  // the deck is made afresh, at the quality asked for
+    if (state.viewing) {
+      // Started from the item on screen: the viewer stays open, with its one
+      // step in the history, and the deck is made afresh around that item at
+      // the quality asked for.
+      stopAuto();
+      auto.running = true;
+      keepAwake(true);
+      for (const i of [...slides.keys()]) dropSlide(i);
+      state.current = -1;
+      setCurrent(index);
+    } else {
+      auto.running = true;
+      keepAwake(true);
+      openViewer(index);                // the deck is made afresh, at the quality asked for
+    }
     clearInterval(autoTimer);
     autoTimer = setInterval(autoTick, 250);
     drawAuto();
@@ -1455,11 +1470,15 @@
     if (video) video.loop = false;      // it is played again here, so that the plays can be counted
     else if (slide && autoPrefs.pan) startDrift(slide);
     // At most two whole videos held in memory: the one on screen and the next.
+    // And while waiting for full quality, no other video of the deck fetches
+    // anything: on a thin link every one of them takes a share.
+    const target = wholeTarget();
     for (const [i, other] of slides) {
       const held = mainVideo(other);
-      if (i === index || i === index + 1 || !held || !held.dataset.whole) continue;
+      if (i === index || i === target || !held) continue;
+      if (!held.dataset.whole && !(autoFull() && held.preload !== 'none')) continue;
       letGoWhole(held);
-      held.preload = 'metadata';        // nothing more of it fetched unless it is swiped back to
+      held.preload = autoFull() ? 'none' : 'metadata';     // nothing more of it fetched unless it is swiped back to
       held.src = videoSource(state.items[i], other.dataset.size);
     }
     fetchWhole();
@@ -1470,6 +1489,9 @@
   function neededPlays(video) {
     const item = state.items[state.current];
     const length = video && isFinite(video.duration) && video.duration > 0 ? video.duration : (item && item.d) || 0;
+    return playsFor(length);
+  }
+  function playsFor(length) {
     // A twentieth of a play's slack: a "one-minute" video of 60.03 seconds
     // still plays five times in five minutes, not six.
     return length ? Math.max(1, Math.ceil(autoMs() / 1000 / length - 0.05)) : 1;
@@ -1519,7 +1541,11 @@
 
   function autoMayMove() {
     if (auto.moving || autoNextIndex() < 0) return false;
-    if (!autoPrefs.wait || auto.shown - auto.doneAt >= autoMs()) return true;
+    if (!autoPrefs.wait || auto.shown - auto.doneAt >= autoMs()) {
+      // Moving on without all of it: what is still on its way plays as it arrives.
+      if (whole.state === 'loading' && whole.item === state.items[autoNextIndex()]) stopWhole();
+      return true;
+    }
     const slide = slides.get(autoNextIndex());
     if (!slide) return true;            // round again to the start: not in the deck yet
     const video = mainVideo(slide);
@@ -1556,16 +1582,62 @@
   }
 
   // "Wait for full quality", for a video, goes further than any browser
-  // will by itself: the whole of the next video, at its top size, is fetched
-  // into memory while this item is on screen, and played from there, so none
-  // of it is left to arrive. Left to itself a browser fetches only so far
-  // ahead of a video that is not playing (Chrome twelve seconds; Safari on a
-  // Mac all of it; an iPhone, not known). Up to 150 MB, two to five minutes
-  // at 1440p: a larger one, or one a phone will not play this way, waits for
-  // its first ten seconds instead. At most two are held, the one on screen
-  // and the next; any other goes back to being fetched as it plays.
+  // will by itself: the next video is fetched whole into memory before it is
+  // reached, and played from there, so none of it is left to arrive. Left to
+  // itself a browser fetches only so far ahead of a video that is not playing
+  // (Chrome twelve seconds; Safari on a Mac all of it; an iPhone, not known).
+  //
+  // On a thin link three things decide whether it is here in time, each
+  // seen on a link imitated at 0.3 MB/s:
+  //   * When it starts. The next video, wherever it is past the photos in
+  //     between, is fetched from the moment the item after the last video
+  //     comes on screen, so every minute of those photos is time to fetch it.
+  //   * Its size. The top size of a one-minute video is 30 to 80 MB, minutes
+  //     of a thin link, so the size is the largest that arrives before the
+  //     auto-scroll must move on (the time of each item until then, and the
+  //     one more turn it waits), at the speed the downloads themselves find.
+  //     The first one starts at the top size and is looked at after eight
+  //     seconds; every eight seconds after, a download that will be late
+  //     starts again smaller, if that arrives sooner.
+  //   * Nothing else fetching. No other video of the deck fetches anything
+  //     meanwhile (one ahead, given its source, fetched 12.7 MB of itself).
+  // Up to 150 MB. At most two are held, the one on screen and the next; any
+  // other goes back to being fetched as it plays. One not here when the
+  // auto-scroll reaches it plays at the size the link carries.
   const WHOLE_MAX = 150e6;
-  const whole = { item: null, ctrl: null, state: '' };
+  const whole = { item: null, ctrl: null, state: '', rung: '', blob: null };
+  let wholeRate = 0;                    // bytes a second, as the downloads found it
+
+  // The size a video is shown at while waiting for full quality.
+  const autoSize = (item) => (whole.item === item && whole.rung) || topRung(item);
+  const rungBytes = (item, name) => (item.rb || [])[(item.r || []).indexOf(name)] || 0;
+
+  // The next video after the item on screen, past any photos. -1: none loaded.
+  function wholeTarget() {
+    for (let i = state.current + 1; i < state.items.length; i++) if (state.items[i].k === 'v') return i;
+    return -1;
+  }
+
+  // Seconds until the auto-scroll moves on to item `target` at the latest:
+  // the time of the item on screen and of each one in between (a video, its
+  // plays), less what has gone, and the one more turn it waits on the last.
+  function autoSecondsTo(target) {
+    const turn = autoMs() / 1000;
+    const span = (item) => (item && item.k === 'v' && item.d > 0 ? playsFor(item.d) * item.d : turn);
+    let seconds = turn - auto.shown / 1000;
+    for (let i = state.current; i < target; i++) seconds += span(state.items[i]);
+    return Math.max(0, seconds);
+  }
+
+  // The largest size that arrives in `seconds` at `rate` bytes a second, a
+  // fifth spare; the smallest if none does. Not knowing, the top one.
+  function wholeRung(item, rate, seconds) {
+    const rungs = (item.r || []).map((name) => ({ name, bytes: rungBytes(item, name) }))
+      .sort((a, b) => Number(a.name) - Number(b.name));
+    if (!rate || !rungs.length || rungs.some((r) => !r.bytes)) return topRung(item);
+    const fits = rungs.filter((r) => r.bytes <= WHOLE_MAX && r.bytes <= rate * seconds * 0.8);
+    return (fits.pop() || rungs[0]).name;
+  }
 
   function letGoWhole(video) {
     if (!video || !video.dataset.whole) return;
@@ -1573,61 +1645,122 @@
     delete video.dataset.whole;
   }
 
-  // The video's ordinary source again, after a download that stopped, was too
-  // large or would not play; and playing, if it is the one on screen.
-  function plainSource(item) {
+  // What a video of the deck has of the download: nothing while it is on its
+  // way (its own loading would race it for the same bytes), the copy in
+  // memory once it is here. False: it is not the video being fetched whole.
+  function wholeInto(video, item) {
+    if (!autoFull() || whole.item !== item || whole.state === 'skip') return false;
+    if (whole.state !== 'done') {
+      video.preload = 'none';
+      if (video.getAttribute('src')) { video.removeAttribute('src'); video.load(); }
+      return true;
+    }
+    if (!video.dataset.whole) {
+      video.dataset.whole = URL.createObjectURL(whole.blob);
+      video.addEventListener('error', () => {
+        // A phone that will not play it from memory: the ordinary way.
+        if (!video.dataset.whole) return;
+        letGoWhole(video);
+        video.removeAttribute('src');
+        if (whole.item === item) Object.assign(whole, { state: 'skip', blob: null });
+        plainSource(item, autoSize(item));
+      }, { once: true });
+    }
+    video.src = video.dataset.whole;
+    video.preload = 'auto';
+    return true;
+  }
+
+  // The video's ordinary source again, at `size`; and playing, if it is the
+  // one on screen.
+  function plainSource(item, size) {
     const index = state.items.indexOf(item);
     const slide = slides.get(index);
     const video = mainVideo(slide);
     if (!video || video.getAttribute('src')) return;
-    video.src = videoSource(item, slide.dataset.size);
+    slide.dataset.size = size;
+    video.src = videoSource(item, size);
     video.preload = 'auto';
     if (index === state.current) playCurrent(video, slide);
   }
 
+  // The download's news, to its video if it is in the deck.
+  function wholeShow(item) {
+    const slide = slides.get(state.items.indexOf(item));
+    const video = mainVideo(slide);
+    if (!video) return;
+    slide.dataset.size = autoSize(item);
+    if (!wholeInto(video, item)) plainSource(item, slide.dataset.size);
+  }
+
   function stopWhole() {
     const { item, ctrl, state: was } = whole;
-    Object.assign(whole, { item: null, ctrl: null, state: '' });
+    Object.assign(whole, { item: null, ctrl: null, state: '', rung: '', blob: null });
     if (ctrl) ctrl.abort();
-    if (item && was === 'loading') plainSource(item);
+    // Not here when it was reached, or no longer wanted: it plays as it
+    // arrives, at the size the link carries.
+    if (item && was === 'loading') plainSource(item, 'auto');
   }
 
   function fetchWhole() {
-    const index = state.current + 1;
+    const index = wholeTarget();
     const item = state.items[index];
     if (item && whole.item === item) return;           // on its way, or here already
     stopWhole();
     const video = mainVideo(slides.get(index));
-    if (!autoFull() || !item || item.k !== 'v' || !video || video.dataset.whole) return;
+    if (!autoFull() || !item || (video && video.dataset.whole)) return;
+    startWhole(item, wholeRung(item, wholeRate, autoSecondsTo(index)), 0);
+  }
+
+  function startWhole(item, rung, tries) {
     const ctrl = new AbortController();
-    Object.assign(whole, { item, ctrl, state: 'loading' });
-    // The video's own loading would race the download for the same bytes.
-    video.preload = 'none';
-    video.removeAttribute('src');
-    video.load();
+    Object.assign(whole, { item, ctrl, state: 'loading', rung, blob: null });
+    wholeShow(item);
     (async () => {
-      const response = await fetch(murl(item, `v/${topRung(item)}.m4s`), { signal: ctrl.signal });
+      const response = await fetch(murl(item, `v/${rung}.m4s`), { signal: ctrl.signal });
       const size = Number(response.headers.get('Content-Length')) || 0;
-      if (!response.ok || !size || size > WHOLE_MAX) throw new Error('not fetched whole');
-      const blob = await response.blob();
-      if (whole.item !== item) return;
-      const into = mainVideo(slides.get(state.items.indexOf(item)));
-      if (!into) throw new Error('no longer in the deck');
-      into.dataset.whole = URL.createObjectURL(blob);
-      into.addEventListener('error', () => {
-        if (!into.dataset.whole) return;
-        letGoWhole(into);
-        into.removeAttribute('src');
-        plainSource(item);
-      }, { once: true });
-      into.src = into.dataset.whole;
-      into.preload = 'auto';
+      if (!response.ok || !size || size > WHOLE_MAX || !response.body) throw new Error('not fetched whole');
+      const reader = response.body.getReader();
+      // Gathered into blobs of a few MB as it comes, so that the whole of it
+      // is never held twice over at the end.
+      const held = [];
+      let parts = [], loose = 0, got = 0, first = 0, firstBytes = 0, looked = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        got += value.length;
+        loose += value.length;
+        if (loose >= 8e6) { held.push(new Blob(parts)); parts = []; loose = 0; }
+        const now = performance.now();
+        if (!first) { first = looked = now; firstBytes = got; continue; }
+        if (now - looked < 8000) continue;
+        looked = now;
+        // How fast it is coming, from the first piece on, and whether it is
+        // here before the auto-scroll moves on to it.
+        wholeRate = (got - firstBytes) / ((now - first) / 1000);
+        const seconds = autoSecondsTo(state.items.indexOf(item));
+        const fits = wholeRung(item, wholeRate, seconds);
+        const late = (size - got) / wholeRate > seconds * 0.9;
+        const sooner = Number(fits) < Number(rung) && rungBytes(item, fits) < size - got;
+        const better = !tries && Number(fits) > Number(rung) && got < size / 3;
+        if (late ? sooner : better) return fits;       // started again at that size
+      }
+      if (whole.ctrl !== ctrl) return '';
+      whole.blob = new Blob([...held, ...parts], { type: 'video/mp4' });
       whole.state = 'done';
-    })().catch(() => {
-      if (whole.item !== item) return;
+      wholeShow(item);
+      return '';
+    })().then((again) => {
+      if (!again || whole.ctrl !== ctrl) return;
+      ctrl.abort();
+      startWhole(item, again, tries + 1);
+    }).catch(() => {
+      // Too large, refused, or cut off: the ordinary way, at the size chosen.
+      if (whole.ctrl !== ctrl) return;
       ctrl.abort();
       whole.state = 'skip';
-      plainSource(item);
+      wholeShow(item);
     });
   }
 
@@ -1683,21 +1816,42 @@
     pill.firstChild.style.width = Math.round(clamp(auto.done ? 1 : part, 0, 1) * 100) + '%';
   }
 
-  // "Slow pan and zoom on photos": over the item's time the photo creeps
-  // twelve per cent closer to a corner, or back out from one, never so far as
-  // to show its edge. The fingers take over the moment a photo is pinched.
-  // An animation made here, not in app.css, so a phone set to reduce motion
-  // still does what the box asks.
+  // "Slow pan and zoom on photos": the photo drifts from the whole of it to a
+  // spot chosen at random, four to sixteen per cent closer, eases to rest, and
+  // drifts on to another, one leg every twenty seconds whatever the item's
+  // time, never so far as to show its edge. The fingers take over the moment
+  // a photo is pinched. An animation made here, not in app.css, so a phone
+  // set to reduce motion still does what the box asks.
+  // Smoothness: a picture that only slides and grows may be drawn at whole
+  // pixels, and so slowly that shows as a judder, a step every second or so.
+  // Turned by a fiftieth of a degree, too little to see, it is drawn between
+  // pixels at every frame instead; translate3d keeps it on the graphics chip.
+  const DRIFT_LEG = 20000;
+  function driftPose(first) {
+    if (first) return 'translate3d(0%, 0%, 0) scale(1) rotate(0deg)';
+    const s = 1.04 + Math.random() * 0.12;
+    const room = (s - 1) * 100 - 0.6;   // how far it may slide, less a sliver for the turn
+    const x = -(0.3 + Math.random() * room), y = -(0.3 + Math.random() * room);
+    return `translate3d(${x.toFixed(2)}%, ${y.toFixed(2)}%, 0) scale(${s.toFixed(3)}) rotate(0.02deg)`;
+  }
   function startDrift(slide) {
     const layer = slide.querySelector('.zoom');
     if (!layer || !layer.animate) return;
     stopDrift(slide, true);
-    const s = 1.12;
-    const x = (-Math.random() * (s - 1) * 100).toFixed(2), y = (-Math.random() * (s - 1) * 100).toFixed(2);
-    const near = { transform: 'translate(0%, 0%) scale(1)' };
-    const far = { transform: `translate(${x}%, ${y}%) scale(${s})` };
-    drifts.set(slide, layer.animate(Math.random() < 0.5 ? [near, far] : [far, near],
-                                    { duration: autoMs(), easing: 'linear', fill: 'forwards' }));
+    let from = driftPose(true);
+    const leg = () => {
+      const to = driftPose(false);
+      const drift = layer.animate([{ transform: from }, { transform: to }],
+                                  { duration: DRIFT_LEG, easing: 'ease-in-out', fill: 'forwards' });
+      from = to;
+      drift.onfinish = () => {
+        if (drifts.get(slide) !== drift) return;   // stopped, or started again, meanwhile
+        leg();
+        drift.cancel();                 // the next leg already holds the same pose
+      };
+      drifts.set(slide, drift);
+    };
+    leg();
   }
   function stopDrift(slide, undo) {
     const drift = slide && drifts.get(slide);
@@ -1750,9 +1904,12 @@
   // Out of sight the browser lets go of the screen; looked at again, ask again.
   document.addEventListener('visibilitychange', () => { if (!document.hidden && auto.running) keepAwake(true); });
 
-  // The admin menu's part: the time, the two boxes, and Start. Kept to that
-  // on purpose: the owner asked for a simple, clean menu.
-  function autoPanel() {
+  // The time, the two boxes, and Start. Kept to that on purpose: the owner
+  // asked for a simple, clean menu. In two places, both the admin's: the
+  // admin menu, which starts from the picture at the top of the wall, and the
+  // very top of an item's (i), which starts from that item (asked for, so
+  // that it can be started from anywhere in the stream). `from` says where.
+  function autoPanel(from) {
     const box = el('div');
     const minutes = el('input');
     minutes.type = 'number';
@@ -1775,12 +1932,12 @@
     const note = el('p', 'error');
     go.addEventListener('click', () => {
       keep();
-      const index = tileNearTop();
+      const index = from();
       if (index < 0) { note.textContent = 'There is nothing on this wall to show.'; return; }
       keepAwake(true);                  // inside the tap: a phone lets a clip start only then
       const begin = () => startAuto(index);
       if (!pushed) { closeSheet(); return begin(); }
-      // The menu closes as Back closes it, and the viewer opens after that.
+      // The sheet closes as Back closes it, and the auto-scroll starts after that.
       window.addEventListener('popstate', () => setTimeout(begin, 0), { once: true });
       history.back();
     });
@@ -1942,6 +2099,8 @@
       const slide = slides.get(state.current);
       const video = currentVideo();
       const meta = d.meta || {};
+      // The admin's alone, above everything else: start the auto-scroll from here.
+      if (isAdmin()) body.append(el('h3', 'first', 'Auto-scroll'), autoPanel(() => state.current));
       body.appendChild(el('h2', '', d.name));
 
       const section = el('button', 'linkish', d.section_path);
@@ -2218,7 +2377,7 @@
       state.realm, (realm) => setRealm(realm))));
 
     body.appendChild(el('h3', '', 'Auto-scroll'));
-    body.appendChild(autoPanel());
+    body.appendChild(autoPanel(tileNearTop));
 
     body.appendChild(el('h3', '', 'Library'));
     const status = body.appendChild(el('div'));

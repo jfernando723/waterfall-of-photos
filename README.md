@@ -50,7 +50,7 @@ No other machine has been considered.
 | Adding pictures | Two ways, both needing the admin password. From the admin page: pick a wall and a folder, choose photos and videos on a phone or a computer, and they are uploaded, several hundred at a go if you like. It shows how far it has got, how fast and how long is left; it waits out a dropped connection and carries on. Or from the NAS itself: its file manager copies folders in through the import door. |
 | Live Photos | A still and its short clip, copied in together under the same name, become one item: the photo, with a LIVE button. Hold a finger on the photo, or tap LIVE, and the clip plays over it. |
 | Key photo | The admin, and only the admin, can show a Live Photo by any moment of its clip instead of its still, on the Visible and the Hidden wall alike, both on its tile and in the viewer, as Photos on an iPhone does it (**Make Key Photo**): (i) → **Change the key photo**, then a slider, one step per frame. **Original** puts the still back exactly as it was; its own copies are never touched. Anyone else sees the picture chosen and nothing else of it, and the server refuses them. |
-| Auto-scroll | The admin, and only the admin, can set the viewer moving on by itself: ··· → admin → **Auto-scroll**, the minutes on each item, whether to wait for each item's best copy to arrive (a video of up to 150 MB is then fetched whole into the phone's memory before it is shown), and a slow pan and zoom on photos, then **Start auto-scroll**. A video shorter than the time plays again until the time is up, and the play under way then is finished; a longer one plays once. **■ Auto** at the bottom stops it. Nobody else sees any sign of it: not in the menu, not in the viewer, and nothing is stored on their device. Its own moves do not keep the admin signed in: after the half hour it carries on on the Visible wall, with its button gone (Back stops it), and stops on the Hidden one. |
+| Auto-scroll | The admin, and only the admin, can set the viewer moving on by itself: ··· → admin → **Auto-scroll**, the minutes on each item, whether to wait for each item's best copy (the next video, past any photos, is then fetched whole into the phone's memory before it is shown, at the largest size that arrives in time and up to 150 MB, while nothing else fetches video), and a slow pan and zoom on photos, then **Start auto-scroll**; the same controls are at the very top of an item's (i) in the viewer, and start from that item. A video shorter than the time plays again until the time is up, and the play under way then is finished; a longer one plays once. **■ Auto** at the bottom stops it. Nobody else sees any sign of it: not in the menu, not in the viewer, and nothing is stored on their device. Its own moves do not keep the admin signed in: after the half hour it carries on on the Visible wall, with its button gone (Back stops it), and stops on the Hidden one. |
 
 Full-size files are never sent to the phone. Each one is converted once, in advance,
 into small copies: three sizes of WebP for a photo; five sizes of H.264 and a short
@@ -114,7 +114,7 @@ is made.
 ```
 git clone https://github.com/jfernando723/waterfall-of-photos.git
 cd waterfall-of-photos
-docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.8.0 .
+docker build -t ghcr.io/jfernando723/waterfall-of-photos:0.8.1 .
 docker compose up -d
 ```
 

@@ -258,6 +258,19 @@ class TestPipeline(unittest.TestCase):
             self.assertGreater(r["avg"], 0)
             self.assertGreaterEqual(r["peak"], r["avg"] * 0.9)
 
+    def test_the_feed_says_how_large_each_size_of_a_video_is(self):
+        # The auto-scroll fetches the next video whole at the largest size that
+        # arrives in time, so the page is told each size's bytes, in the order
+        # of the names, and they are the files it would fetch.
+        it = item_named("IMG_0009.MOV")
+        entry = next(e for e in library.feed("visible", None, "new", 1, 0, 100, "video") if e["id"] == it["id"])
+        self.assertEqual(entry["r"], ["360", "540", "720", "1080"])
+        folder = os.path.join(media.deriv_dir(it["key"]), "v")
+        self.assertEqual(entry["rb"], [os.path.getsize(os.path.join(folder, f"{r}.m4s")) for r in entry["r"]])
+        self.assertEqual(entry["rb"], sorted(entry["rb"]), "smallest first, as the names are")
+        photo = next(e for e in library.feed("visible", None, "new", 1, 0, 100, "photo"))
+        self.assertNotIn("rb", photo)
+
     def test_live_photo_motion_clip_is_not_an_item(self):
         row = library.connect().execute("SELECT status FROM items WHERE name='IMG_0010.MOV'").fetchone()
         self.assertEqual(row["status"], "paired")
@@ -1177,8 +1190,15 @@ class TestHTTP(unittest.TestCase):
         # keeps the pieces that carry those promises from being undone.
         js = self.client().get("/static/app.js").get_data(as_text=True)
         panel = js[js.index("function adminPanel(body)"):js.index("async function renderStatus(")]
-        self.assertIn("body.appendChild(autoPanel());", panel)
-        self.assertEqual(js.count("autoPanel()"), 2, "made in the admin's menu and nowhere else")
+        self.assertIn("body.appendChild(autoPanel(tileNearTop));", panel)
+        # ...and at the very top of an item's (i), above its name, for the
+        # admin alone, starting from that item (asked for: to start from
+        # anywhere in the stream).
+        details = js[js.index("$('viewer-info').addEventListener('click'"):js.index("// ------------------------------------------------------------ sections --")]
+        here = "if (isAdmin()) body.append(el('h3', 'first', 'Auto-scroll'), autoPanel(() => state.current));"
+        self.assertIn(here, details)
+        self.assertLess(details.index(here), details.index("body.appendChild(el('h2', '', d.name));"))
+        self.assertEqual(js.count("autoPanel("), 3, "declared once, and made in those two places only")
         self.assertEqual(js.count("'Start auto-scroll'"), 1)
         self.assertEqual(js.count("startAuto("), 2, "declared once and called from that menu once")
         start = js[js.index("function startAuto(index)"):js.index("function stopAuto()")]
@@ -1238,7 +1258,10 @@ class TestHTTP(unittest.TestCase):
         self.assertEqual(needed(1, 600), 1, "longer than the time: once, whole")
         self.assertEqual(js.count("autoMinutes() * 60000"), 1, "whole minutes, as asked")
         build = js[js.index("function buildSlide(index)"):js.index("const mainVideo =")]
-        self.assertIn("const size = autoFull() ? topRung(item) : 'auto';", build)
+        self.assertIn("const size = autoFull() && (index !== state.current || whole.item === item) ? autoSize(item) : 'auto';",
+                      build, "the best that arrives in time; the video it starts on, which had no time, as the link carries")
+        self.assertIn("video.preload = autoFull() && index !== state.current ? 'none' : 'metadata';", build)
+        self.assertIn("if (!wholeInto(video, item)) video.src = videoSource(item, size);", build)
         self.assertIn("const size = prefs.photoHigh || autoFull() ? 'l' : 'm';", build)
         self.assertIn("const autoFull = () => auto.running && autoPrefs.wait;", js)
         # A video waited for is ready once its first ten seconds are here: a
@@ -1246,24 +1269,120 @@ class TestHTTP(unittest.TestCase):
         # ready to play through (seen in Chrome: twelve seconds, then nothing).
         self.assertIn("if (video.readyState >= 3 && have >= Math.min(10, length) - 0.25) return true;", js)
         # And beyond that, asked for: the whole of the next video fetched into
-        # memory and played from there, at its top size, up to 150 MB, only
-        # while waiting for full quality; at most two held, each let go of with
-        # its slide; a larger one, or one that will not play, the ordinary way.
-        fetch = js[js.index("function fetchWhole()"):js.index("function autoNext()")]
-        self.assertIn("if (!autoFull() || !item || item.k !== 'v' || !video || video.dataset.whole) return;", fetch)
-        self.assertIn("fetch(murl(item, `v/${topRung(item)}.m4s`), { signal: ctrl.signal })", fetch)
+        # memory and played from there, up to 150 MB, only while waiting for
+        # full quality; at most two held, each let go of with its slide; one
+        # that will not play, the ordinary way.
+        whole = js[js.index('// "Wait for full quality", for a video'):js.index("function autoNext()")]
+        fetch = whole[whole.index("function fetchWhole()"):]
+        self.assertIn("if (!autoFull() || !item || (video && video.dataset.whole)) return;", fetch)
+        self.assertIn("fetch(murl(item, `v/${rung}.m4s`), { signal: ctrl.signal })", fetch)
         self.assertIn("size > WHOLE_MAX", fetch)
         self.assertIn("const WHOLE_MAX = 150e6;", js)
-        self.assertIn("plainSource(item);", fetch)
+        self.assertIn("whole.state = 'skip';", fetch)
         self.assertIn("if (video.dataset.whole) return true;", js)
         drop = js[js.index("function dropSlide(index)"):js.index("function renderWindow()")]
         self.assertIn("letGoWhole(video);", drop)
         begin = js[js.index("function autoBegin(index)"):js.index("function neededPlays(video)")]
-        self.assertIn("if (i === index || i === index + 1 || !held || !held.dataset.whole) continue;", begin)
+        self.assertIn("if (i === index || i === target || !held) continue;", begin)
         stop = js[js.index("function stopAuto()"):js.index("function autoBegin(index)")]
         self.assertIn("stopWhole();", stop)
-        # Never stuck for good: at most one more turn of the time.
-        self.assertIn("if (!autoPrefs.wait || auto.shown - auto.doneAt >= autoMs()) return true;", js)
+        # Never stuck for good: at most one more turn of the time; and what is
+        # still on its way then plays as it arrives, at the size the link carries.
+        self.assertIn("if (!autoPrefs.wait || auto.shown - auto.doneAt >= autoMs()) {", js)
+        self.assertIn("if (item && was === 'loading') plainSource(item, 'auto');", whole)
+
+    def test_waiting_for_full_quality_fetches_the_next_video_early_at_a_size_that_arrives(self):
+        # Reported: after two minutes of a photo the next video still was not
+        # ready, on a link the page measured at 0.2 to 0.4 MB/s.
+        # Imitated at 0.3 MB/s: the top size of a 21-second video (24 MB)
+        # did not arrive in the two minutes, while two other videos of the deck
+        # took shares of the link; all of it was then thrown away and the video
+        # streamed from nothing at a size the link cannot carry.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        whole = js[js.index('// "Wait for full quality", for a video'):js.index("function autoNext()")]
+        # 1. It looks past the photos: the next video, wherever it is.
+        target = whole[whole.index("function wholeTarget()"):whole.index("function autoSecondsTo(")]
+        self.assertIn("for (let i = state.current + 1; i < state.items.length; i++) if (state.items[i].k === 'v') return i;", target)
+        begin = js[js.index("function autoBegin(index)"):js.index("function neededPlays(video)")]
+        self.assertIn("const target = wholeTarget();", begin)
+        # 2. The time it has: each item until then (a video, its plays), less
+        # what has gone, and the one more turn the auto-scroll waits.
+        until = whole[whole.index("function autoSecondsTo("):whole.index("function wholeRung(")]
+        self.assertIn("playsFor(item.d) * item.d : turn", until)
+        self.assertIn("let seconds = turn - auto.shown / 1000;", until)
+        self.assertIn("for (let i = state.current; i < target; i++) seconds += span(state.items[i]);", until)
+        # 3. The size: the largest that arrives in that time, a fifth spare,
+        # from the bytes the feed lists; the top one when nothing is known.
+        rung = whole[whole.index("function wholeRung("):whole.index("function letGoWhole(")]
+        self.assertIn("r.bytes <= WHOLE_MAX && r.bytes <= rate * seconds * 0.8", rung)
+        self.assertIn("if (!rate || !rungs.length || rungs.some((r) => !r.bytes)) return topRung(item);", rung)
+        self.assertIn("startWhole(item, wholeRung(item, wholeRate, autoSecondsTo(index)), 0);", whole)
+        # The same arithmetic on such a link: a photo of one minute before a
+        # 28-second video, at 0.3 MB/s, leaves two minutes; its 1080 copy
+        # (17 MB) fits in them, its top size (32 MB) does not.
+        sizes = {"360": 2.2e6, "540": 4.5e6, "720": 8.7e6, "1080": 17.2e6, "1440": 32.3e6}
+        pick = lambda rate, seconds: ([r for r, b in sizes.items() if b <= rate * seconds * 0.8] or ["360"])[-1]
+        self.assertEqual(pick(0.3e6, 120), "1080")
+        self.assertEqual(pick(0.3e6, 180), "1440", "with one more photo before it")
+        self.assertEqual(pick(1.5e6, 120), "1440", "a good day")
+        # 4. It looks at its own speed every eight seconds: late, it starts
+        # again smaller if that arrives sooner; the first time, larger if that
+        # fits and little of this one is here.
+        start = whole[whole.index("function startWhole("):]
+        self.assertIn("if (now - looked < 8000) continue;", start)
+        self.assertIn("wholeRate = (got - firstBytes) / ((now - first) / 1000);", start)
+        # Never held twice over: gathered into blobs of 8 MB as it comes.
+        self.assertIn("if (loose >= 8e6) { held.push(new Blob(parts)); parts = []; loose = 0; }", start)
+        self.assertIn("whole.blob = new Blob([...held, ...parts], { type: 'video/mp4' });", start)
+        self.assertIn("const late = (size - got) / wholeRate > seconds * 0.9;", start)
+        self.assertIn("const sooner = Number(fits) < Number(rung) && rungBytes(item, fits) < size - got;", start)
+        self.assertIn("const better = !tries && Number(fits) > Number(rung) && got < size / 3;", start)
+        self.assertIn("if (late ? sooner : better) return fits;", start)
+        # 5. Nothing else fetches meanwhile: no video of the deck but the one
+        # on screen and the one fetched whole, and not the ordinary preload.
+        self.assertIn("if (!held.dataset.whole && !(autoFull() && held.preload !== 'none')) continue;", begin)
+        self.assertIn("held.preload = autoFull() ? 'none' : 'metadata';", begin)
+        ahead = js[js.index("function preloadAhead()"):js.index("function currentVideo()")]
+        self.assertIn("if (video && prefs.ahead > 0 && !autoFull() && video.preload !== 'auto') {", ahead)
+        into = whole[whole.index("function wholeInto("):whole.index("function plainSource(")]
+        self.assertIn("if (!autoFull() || whole.item !== item || whole.state === 'skip') return false;", into)
+        self.assertIn("video.preload = 'none';", into)
+        # 6. Moving on without all of it, the download stops first, so the
+        # video is given its source before it is played.
+        may = js[js.index("function autoMayMove()"):js.index('// "Wait for full quality", for a video')]
+        self.assertIn("if (whole.state === 'loading' && whole.item === state.items[autoNextIndex()]) stopWhole();", may)
+
+    def test_the_slow_pan_and_zoom_moves_steadily_and_never_shows_an_edge(self):
+        # Asked for: smoother, "perhaps moving a little faster". One leg every
+        # twenty seconds whatever the item's time, eased at both ends, each leg
+        # starting where the last one stopped; turned a fiftieth of a degree so
+        # the picture is drawn between pixels instead of stepping a whole one.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        drift = js[js.index("const DRIFT_LEG = 20000;"):js.index("function stopDrift(slide, undo)")]
+        self.assertNotIn("autoMs()", drift, "the pace no longer stretches with the minutes")
+        self.assertIn("{ duration: DRIFT_LEG, easing: 'ease-in-out', fill: 'forwards' }", drift)
+        self.assertIn("return 'translate3d(0%, 0%, 0) scale(1) rotate(0deg)';", drift, "it sets off from the whole photo")
+        self.assertIn("const s = 1.04 + Math.random() * 0.12;", drift)
+        self.assertIn("const room = (s - 1) * 100 - 0.6;", drift)
+        self.assertIn("const x = -(0.3 + Math.random() * room), y = -(0.3 + Math.random() * room);", drift)
+        self.assertIn("scale(${s.toFixed(3)}) rotate(0.02deg)`;", drift)
+        self.assertIn("from = to;", drift)
+        self.assertIn("if (drifts.get(slide) !== drift) return;", drift)
+        # The edge, here: a pose covers the screen if it is slid no further than
+        # it is enlarged, and the turn moves a far corner by less than the
+        # sliver kept back (0.3 per cent of the other side). Every pose is
+        # checked at its tightest, on screens from a phone to a wide monitor;
+        # a leg between two such poses keeps to them all the way.
+        turn = math.radians(0.02)
+        for width, height in ((393, 852), (375, 812), (852, 393), (1440, 900), (2560, 1440), (3440, 1440)):
+            for s in (1.04, 1.10, 1.16):
+                room = (s - 1) * 100 - 0.6
+                for x in (-0.3, -(0.3 + room)):
+                    self.assertLessEqual(x, 0)
+                    self.assertGreaterEqual(x + (s - 1) * 100, 0, (width, height, s, x))
+                    near, far = -x / 100 * width, (x + (s - 1) * 100) / 100 * width
+                    self.assertGreater(min(near, far), turn * s * height, (width, height, s, x))
+                    self.assertGreater(0.003 * height, turn * s * width, (width, height, s))
 
     def test_the_admin_page_is_told_what_a_look_found_and_what_a_check_found(self):
         c = self.client(ADMIN)

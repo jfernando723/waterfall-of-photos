@@ -215,6 +215,8 @@ input[type="password"], input[type="text"] {
 .sheet h2 { font-size: 18px; margin: 0 0 12px; overflow-wrap: anywhere; }
 .sheet h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
             color: var(--muted); margin: 22px 0 8px; font-weight: 600; }
+.sheet h3.first { margin-top: 0; }
+.sheet h3.first ~ h2 { margin-top: 18px; }
 
 .rows { margin: 0; }
 .rows div { display: flex; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); }

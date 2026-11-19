@@ -981,6 +981,9 @@ def feed(realm: str, section_id: int | None, order: str, seed: int, offset: int,
             # Which sizes exist, for the size picker and for browsers that
             # cannot adapt by themselves.
             entry["r"] = [g["name"] for g in info.get("rungs", [])]
+            # ...and how large each is, in the same order, so that a page
+            # fetching one ahead can take the largest that arrives in time.
+            entry["rb"] = [g.get("bytes", 0) for g in info.get("rungs", [])]
             if info.get("sizes", {}).get("p"):
                 entry["p"] = 1          # has a moving preview for the wall
         elif r["info"] and '"live"' in r["info"]:
