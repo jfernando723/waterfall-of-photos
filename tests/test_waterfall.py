@@ -1119,6 +1119,30 @@ class TestHTTP(unittest.TestCase):
         self.assertIn("openSettings(true)", unlock, "it shows the admin menu instead")
         self.assertEqual(js.count("setRealm('hidden')"), 0, "nothing chooses the Hidden wall but the switch")
 
+    def test_the_admin_menus_wall_switch_keeps_the_menu_open(self):
+        # Asked for: going between Visible and Hidden from the admin menu must
+        # not take the menu away. What follows from a menu that stays: uploads
+        # go to the wall now chosen, and the switch can be used again before a
+        # wall has arrived. No test here can click (a real browser was used for
+        # that); this keeps the pieces from being undone.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        panel = js[js.index("function adminPanel(body)"):js.index("async function renderStatus(")]
+        self.assertIn("if (realm === state.realm) return;", panel, "a second tap must not lose the wall's place")
+        self.assertIn("setRealm(realm, true);", panel)
+        self.assertIn("up.follow();", panel)
+        self.assertEqual(js.count("setRealm(realm, true)"), 1, "the admin menu's switch alone keeps a menu open")
+        realm = js[js.index("async function setRealm(realm"):js.index("const places = {")]
+        self.assertIn("if (!menuStays || target !== realm) { unwindHistory(); closeSheet(); }", realm)
+        self.assertIn("if (turn !== state.turn) return;", realm, "only the latest switch finishes")
+        keep = js[js.index("function keepPlace()"):js.index("function writeHiddenPlace()")]
+        self.assertLess(keep.index("if (state.arriving) return;"), keep.index("places[state.realm] ="),
+                        "a wall not all here must not replace the place kept for it")
+        upload = js[js.index("function uploadPanel()"):js.index("function passwordForm()")]
+        follow = upload[upload.index("up.follow = () => {"):]
+        self.assertLess(follow.index("if (chosen || picking) return;"), follow.index("realm = state.realm;"),
+                        "a destination chosen by hand is never moved")
+        self.assertIn("wanted === state.realm && !state.arriving", upload, "never the other wall's folders")
+
     def test_leaving_with_the_hidden_wall_up_puts_the_visible_one_back(self):
         # Asked for: leaving Waterfall for another app, the Home Screen or a
         # locked phone, or closing it, must not leave the Hidden wall up for
@@ -1134,7 +1158,7 @@ class TestHTTP(unittest.TestCase):
         self.assertIn("if (state.realm === 'hidden') setRealm('visible');", left)
         # Everything that takes the Hidden wall off the screen happens before the
         # first wait for the server: a phone puts the page to sleep straight away.
-        realm = js[js.index("async function setRealm(realm)"):js.index("const places = {")]
+        realm = js[js.index("async function setRealm(realm"):js.index("const places = {")]
         wait = realm.index("await ")
         for step in ("keepPlace()", "closeViewer(true)", "closeSheet()", "return showPlace(place)", "clearWall()"):
             self.assertLess(realm.index(step), wait, step)
@@ -1220,7 +1244,7 @@ class TestHTTP(unittest.TestCase):
         idle = js[js.index("async function leaveAdminIfIdle()"):js.index("setInterval(leaveAdminIfIdle")]
         self.assertIn("else if (auto.running && state.realm === 'visible' && $('sheet').hidden) return;", idle)
         self.assertIn("else await setRealm('visible');", idle)
-        realm = js[js.index("async function setRealm(realm)"):js.index("const places = {")]
+        realm = js[js.index("async function setRealm(realm"):js.index("const places = {")]
         self.assertIn("closeViewer(true)", realm, "putting the wall back closes the viewer, which stops it")
 
     def test_nobody_but_the_admin_sees_any_sign_of_the_auto_scroll(self):
@@ -1351,6 +1375,52 @@ class TestHTTP(unittest.TestCase):
         # video is given its source before it is played.
         may = js[js.index("function autoMayMove()"):js.index('// "Wait for full quality", for a video')]
         self.assertIn("if (whole.state === 'loading' && whole.item === state.items[autoNextIndex()]) stopWhole();", may)
+
+    def test_the_auto_scroll_plays_a_video_again_without_sending_it_back_after_it_ends(self):
+        # Reported (in Firefox): the first play smooth, then about
+        # fifteen seconds of spinner before every play after it, at home and
+        # away. Measured in Firefox 160 on this Mac: a video played from memory
+        # and sent back to the start after it has ended sits exactly fifteen
+        # seconds before playing; its own loop, and its source given again,
+        # start at once. So a video goes round by itself while another play is
+        # sure to follow (or while the next item is awaited), each time round
+        # counted; only a play that may be its last ends.
+        js = self.client().get("/static/app.js").get_data(as_text=True)
+        begin = js[js.index("function autoBegin(index)"):js.index("function neededPlays(video)")]
+        self.assertIn("if (video) autoLoop(video);", begin)
+        self.assertNotIn("video.loop = false", begin)
+        rules = js[js.index("function autoLoop(video)"):js.index("function autoTick()")]
+        self.assertIn("video.loop = auto.done || auto.plays + 1 < neededPlays(video);", rules)
+        ended = rules[rules.index("function autoEnded("):rules.index("function autoLooped(")]
+        self.assertIn("if (autoPlayed(video)) return;", ended)
+        self.assertIn("fromStart(video);", ended)
+        self.assertNotIn("currentTime = 0", ended, "never sent back once it has ended")
+        start = rules[rules.index("function fromStart(video)"):]
+        self.assertIn("if (video.dataset.whole) video.src = video.dataset.whole;", start)
+        build = js[js.index("function buildSlide(index)"):js.index("const mainVideo =")]
+        self.assertIn("autoLooped(video);", build)
+        one = js[js.index("function autoNext()"):js.index("let autoPillMade")]
+        self.assertIn("if (video) fromStart(video);", one)
+        self.assertNotIn("currentTime = 0", one)
+        # Going round is told by the time jumping from near the end to near the
+        # start. Firefox calls these files' length unknown (Infinity) while it
+        # streams them, so the length is the library's then, as for the plays.
+        looped = rules[rules.index("function autoLooped("):rules.index("function fromStart(")]
+        self.assertIn("const length = playLength(video);", looped)
+        self.assertNotIn("video.duration", looped)
+        self.assertIn("isFinite(video.duration) && video.duration > 0 ? video.duration : (item && item.d) || 0",
+                      js[js.index("function playLength(video)"):js.index("function playsFor(length)")])
+        went_round = lambda was, now, length: now < was and was > length - 1.5 and now < min(1.5, length / 2)
+        self.assertTrue(went_round(11.814, 0.023, 12.0), "seen in Firefox, a 12-second video going round")
+        self.assertTrue(went_round(1.9, 0.1, 2.0), "a two-second one")
+        self.assertFalse(went_round(11.534, 11.814, 12.0), "playing on")
+        self.assertFalse(went_round(9.0, 3.0, 12.0), "dragged back part way: not a play")
+        # The count, as before: a 12-second video in one minute plays five
+        # times; the first four go round, the fifth ends and the move follows.
+        needed = lambda minutes, length: max(1, math.ceil(minutes * 60 / length - 0.05))
+        loops = [plays + 1 < needed(1, 12.03) for plays in range(needed(1, 12.03))]
+        self.assertEqual(loops, [True, True, True, True, False])
+        self.assertEqual([plays + 1 < needed(1, 70) for plays in range(needed(1, 70))], [False], "a longer one: once, ending")
 
     def test_the_slow_pan_and_zoom_moves_steadily_and_never_shows_an_edge(self):
         # Asked for: smoother, "perhaps moving a little faster". One leg every

@@ -50,6 +50,7 @@
     sections: [], sectionById: new Map(), totals: { photos: 0, videos: 0 }, tags: [],
     section: null, tag: null, kind: 'all', seed: newSeed(),
     items: [], more: true, loading: false, pending: null, generation: 0,
+    arriving: false, turn: 0,         // a switch of wall on its way (see setRealm)
     cols: [], heights: [],
     viewing: false, current: -1, wantSound: false,
   };
@@ -58,7 +59,7 @@
   // The auto-scroll (see "auto-scroll", below). Kept up here because the
   // admin's clock, next, has to tell its moves from a person's.
   const auto = { running: false, quietUntil: 0, last: 0, shown: 0, plays: 0, done: false, doneAt: 0,
-                 moving: false, userPaused: false, progressAt: 0, warmed: null };
+                 moving: false, userPaused: false, progressAt: 0, warmed: null, at: 0 };
 
   // -------------------------------------------------------- link measure --
   // The phone already downloads images constantly, so it can time them
@@ -273,21 +274,32 @@
   // item from one can linger on screen in the other. Each wall comes back as
   // it was left (see "places", below); the same wall asked for again starts
   // afresh, as it always has.
-  async function setRealm(realm) {
+  //
+  // `menuStays` is the admin menu's Wall switch: the wall changes behind that
+  // menu, which stays until it is closed by hand. Everything else that changes
+  // the wall (leaving, signing out, a sign-in run out) closes whatever is open.
+  //
+  // With the menu staying, the switch can be used again before a wall has
+  // arrived. Until it has, `arriving` says that the lists in `state` may still
+  // be the other wall's, and `turn` lets only the latest switch finish.
+  async function setRealm(realm, menuStays = false) {
     const target = realm === 'hidden' && isAdmin() ? 'hidden' : 'visible';
     const switching = target !== state.realm;
     if (switching) keepPlace();
-    unwindHistory();
     closeViewer(true);
-    closeSheet();
+    if (!menuStays || target !== realm) { unwindHistory(); closeSheet(); }
     const place = !switching ? null : target === 'hidden' ? places.hidden || readHiddenPlace() : places.visible;
     state.realm = target;
+    if (switching) state.arriving = true;
+    const turn = ++state.turn;
     if (place) return showPlace(place);
     state.section = null;
     state.tag = null;
     clearWall();
     try { await loadSections(); } catch { /* the wall will say what is wrong */ }
-    if (state.realm === target) resetWall();
+    if (turn !== state.turn) return;        // switched again meanwhile
+    state.arriving = false;
+    resetWall();
   }
 
   // ------------------------------------------------------------- places --
@@ -320,6 +332,7 @@
 
   function keepPlace() {
     if (state.realm === 'hidden' && !isAdmin()) return forgetHiddenPlace();
+    if (state.arriving) return;             // not all here yet: what was kept before still stands
     places[state.realm] = {
       section: state.section, tag: state.tag, kind: state.kind, order: prefs.order, seed: state.seed,
       items: state.items, more: state.more, sections: state.sections, totals: state.totals, tags: state.tags,
@@ -366,18 +379,21 @@
       // Kept while the page lived: shown at once, with nothing to ask the server.
       Object.assign(state, { sections: place.sections, totals: place.totals, tags: place.tags,
                              sectionById: new Map(place.sections.map((s) => [s.id, s])) });
+      state.arriving = false;
       resetWall(place);
       return goBackTo(place);
     }
     // Written down before Waterfall was closed: the same pages are asked for
     // again with the same order and the same shuffle, and come back the same.
-    const realm = state.realm;
+    const turn = state.turn;
     clearWall();
     try { await loadSections(); } catch { /* the wall will say what is wrong */ }
-    if (state.realm !== realm) return;
+    if (turn !== state.turn) return;
     resetWall();
     const generation = state.generation;
     await loadUpTo(place.count);
+    if (turn !== state.turn) return;
+    state.arriving = false;
     if (generation === state.generation) goBackTo(place);
   }
 
@@ -445,11 +461,15 @@
       : [state.totals.photos, state.totals.videos];
     const shown = state.kind === 'photo' ? totals[0] : state.kind === 'video' ? totals[1] : totals[0] + totals[1];
     $('wall-count').textContent = shown ? plural(shown, 'item') : '';
-    if (!kept || !kept.items) return loadMore();
+    if (!kept || !kept.items || (!kept.items.length && kept.more)) return loadMore();
     state.items = kept.items.slice();
     state.more = kept.more;
     state.items.forEach(addTile);
     sayWhatIsLeft();
+    // The foot of the wall may be as near as it was on the other wall, and then
+    // it is not reported again: asked afresh, or a page cut short never comes.
+    endWatcher.unobserve($('sentinel'));
+    endWatcher.observe($('sentinel'));
   }
 
   function sayWhatIsLeft() {
@@ -601,9 +621,10 @@
     if (tile) openViewer(Number(tile.dataset.index));
   });
 
-  new IntersectionObserver((entries) => {
+  const endWatcher = new IntersectionObserver((entries) => {
     if (entries.some((e) => e.isIntersecting)) loadMore();
-  }, { rootMargin: '1400px' }).observe($('sentinel'));
+  }, { rootMargin: '1400px' });
+  endWatcher.observe($('sentinel'));
 
   function setSection(id) {
     unwindHistory();
@@ -713,9 +734,10 @@
         if (index !== state.current) return;
         showTime(video);
         auto.progressAt = performance.now();
+        autoLooped(video);
       });
       video.addEventListener('loadedmetadata', () => { if (index === state.current) showTime(video); });
-      video.addEventListener('ended', () => autoEnded(index, video));     // only while the auto-scroll runs: loop is off then
+      video.addEventListener('ended', () => autoEnded(index, video));     // only under the auto-scroll: a play that may be its last
       const paused = el('div', 'paused');
       paused.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
       slide.append(video, spinner, paused);
@@ -1463,11 +1485,11 @@
   function autoBegin(index) {
     const now = performance.now();
     Object.assign(auto, { last: now, shown: 0, plays: 0, done: false, doneAt: 0, moving: false,
-                          userPaused: false, progressAt: now, warmed: null });
+                          userPaused: false, progressAt: now, warmed: null, at: 0 });
     for (const [i, slide] of slides) if (i !== index) stopDrift(slide, true);
     const slide = slides.get(index);
     const video = mainVideo(slide);
-    if (video) video.loop = false;      // it is played again here, so that the plays can be counted
+    if (video) autoLoop(video);         // its plays are counted: see autoPlayed
     else if (slide && autoPrefs.pan) startDrift(slide);
     // At most two whole videos held in memory: the one on screen and the next.
     // And while waiting for full quality, no other video of the deck fetches
@@ -1487,9 +1509,13 @@
 
   // How many times the video on screen plays in the time.
   function neededPlays(video) {
+    return playsFor(playLength(video));
+  }
+  // How long one play of the video on screen is. Firefox calls the length of
+  // these files unknown (Infinity) while it streams them: then the library's.
+  function playLength(video) {
     const item = state.items[state.current];
-    const length = video && isFinite(video.duration) && video.duration > 0 ? video.duration : (item && item.d) || 0;
-    return playsFor(length);
+    return video && isFinite(video.duration) && video.duration > 0 ? video.duration : (item && item.d) || 0;
   }
   function playsFor(length) {
     // A twentieth of a play's slack: a "one-minute" video of 60.03 seconds
@@ -1497,14 +1523,55 @@
     return length ? Math.max(1, Math.ceil(autoMs() / 1000 / length - 0.05)) : 1;
   }
 
-  function autoEnded(index, video) {
-    if (!auto.running || index !== state.current) return;
+  // A video on screen plays again by going round by itself (its own loop)
+  // while another play is sure to follow, or while the auto-scroll waits for
+  // the next item; each time round is counted as a play. Only a play that may
+  // be its last ends, so that the move comes at its end. Never sent back to
+  // the start once it has ended, if it can be helped: Firefox, sending a video
+  // played from memory back after it has ended, sits fifteen seconds before
+  // playing it again (measured on Firefox 160, on every replay, over this
+  // Mac's own link: it is not the network), while its own loop goes round at
+  // once. Reported as a spinner of about fifteen seconds between plays, at
+  // home and away.
+  function autoLoop(video) {
+    video.loop = auto.done || auto.plays + 1 < neededPlays(video);
+  }
+
+  // One play of the video on screen is over, at its end or by going round.
+  // True: the auto-scroll has moved on.
+  function autoPlayed(video) {
     auto.plays += 1;
     auto.progressAt = performance.now();
     if (!auto.done && auto.plays >= neededPlays(video)) { auto.done = true; auto.doneAt = auto.shown; }
-    if (auto.done && !autoHeld() && autoMayMove()) return autoNext();
-    // Due to play again, or waiting for the next item: from the start.
-    try { video.currentTime = 0; } catch { /* not seekable yet */ }
+    if (auto.done && !autoHeld() && autoMayMove()) { autoNext(); return true; }
+    autoLoop(video);
+    return false;
+  }
+
+  function autoEnded(index, video) {
+    if (!auto.running || index !== state.current) return;
+    if (autoPlayed(video)) return;
+    // Due to play again after all (held, or waiting for the next item): from
+    // the start, and round by itself after that.
+    fromStart(video);
+  }
+
+  // The video on screen gone round by itself: from near its end to near its start.
+  function autoLooped(video) {
+    const was = auto.at;
+    auto.at = video.currentTime;
+    const length = playLength(video);
+    if (!auto.running || !video.loop || !length) return;
+    if (auto.at < was && was > length - 1.5 && auto.at < Math.min(1.5, length / 2)) autoPlayed(video);
+  }
+
+  // From the start, once a play has ended. A video played from memory is
+  // given its source again rather than sent back (see autoLoop): that starts
+  // at once in Firefox, as the sending back does in the other browsers. One
+  // being streamed is sent back, which keeps what it has fetched.
+  function fromStart(video) {
+    if (video.dataset.whole) video.src = video.dataset.whole;
+    else try { video.currentTime = 0; } catch { /* not seekable yet */ }
     video.play().catch(() => {});
   }
 
@@ -1771,7 +1838,7 @@
     if (next === state.current) {       // one item only: round again
       const video = currentVideo();
       autoBegin(next);
-      if (video) { try { video.currentTime = 0; } catch { /* from where it is */ } video.play().catch(() => {}); }
+      if (video) fromStart(video);
       return;
     }
     auto.moving = true;
@@ -1932,8 +1999,12 @@
     const note = el('p', 'error');
     go.addEventListener('click', () => {
       keep();
-      const index = from();
-      if (index < 0) { note.textContent = 'There is nothing on this wall to show.'; return; }
+      const index = state.arriving ? -1 : from();
+      if (index < 0) {
+        note.textContent = state.arriving || state.loading ? 'The wall is still loading. Try again in a moment.'
+          : 'There is nothing on this wall to show.';
+        return;
+      }
       keepAwake(true);                  // inside the tap: a phone lets a clip start only then
       const begin = () => startAuto(index);
       if (!pushed) { closeSheet(); return begin(); }
@@ -2068,16 +2139,17 @@
   }
   function segmented(options, value, onPick) {
     const group = el('div', 'segmented');
+    // Also for the page itself to move it, which is not a pick.
+    group.show = (shown) => options.forEach(([key], i) => {
+      group.children[i].setAttribute('aria-pressed', String(key === shown));
+    });
     for (const [key, label] of options) {
       const button = el('button', '', label);
       button.type = 'button';
-      button.setAttribute('aria-pressed', String(key === value));
-      button.addEventListener('click', () => {
-        for (const b of group.children) b.setAttribute('aria-pressed', String(b === button));
-        onPick(key);
-      });
+      button.addEventListener('click', () => { group.show(key); onPick(key); });
       group.appendChild(button);
     }
+    group.show(value);
     return group;
   }
   function option(label, control, wrap) {
@@ -2374,7 +2446,12 @@
     body.appendChild(out);
     body.appendChild(el('p', 'muted small', 'Logging out shows the site as everyone else sees it. The switch below does the same without logging out.'));
     body.appendChild(option('Wall', segmented([['visible', 'Visible'], ['hidden', 'Hidden']],
-      state.realm, (realm) => setRealm(realm))));
+      state.realm, (realm) => {
+        // A second tap on the wall showing must not start it afresh and lose its place.
+        if (realm === state.realm) return;
+        setRealm(realm, true);
+        up.follow();
+      })));
 
     body.appendChild(el('h3', '', 'Auto-scroll'));
     body.appendChild(autoPanel(tileNearTop));
@@ -2503,7 +2580,7 @@
                // `?care=1` (to 3) in the address starts it careful: for trying the
                // careful ways of sending against a server where the ordinary way stalls.
                care: clamp(Math.floor(Number(new URLSearchParams(location.search).get('care')) || 0), 0, 3),
-               view: null, drawTimer: 0, shownDone: false };
+               view: null, follow: () => {}, drawTimer: 0, shownDone: false };
 
   function upReset() {
     Object.assign(up, { jobs: [], next: 0, active: 0, done: 0, skipped: 0, failed: [], bytes: 0, sent: 0,
@@ -2848,6 +2925,10 @@
   function uploadPanel() {
     const box = el('div', 'upload');
     let realm = up.realm && (up.realm !== 'hidden' || isAdmin()) ? up.realm : state.realm;
+    // Until a destination has been chosen it is the wall showing, and follows
+    // the Wall switch: what is meant for Hidden must not land on Visible.
+    let chosen = !!up.realm;
+    let picking = false;                // the phone's picker is out, or handing the files over
     // Where it goes: a wall, then a folder chosen from the ones there are, or a new one.
     const folder = el('select');
     folder.setAttribute('aria-label', 'Folder');
@@ -2858,10 +2939,13 @@
     fresh.enterKeyHint = 'done';
     fresh.hidden = true;
     const offer = async () => {
+      const wanted = realm;
       let sections = [];
       try {
-        sections = (realm === state.realm ? state.sections : (await api('/api/sections?realm=' + realm)).sections);
+        sections = (wanted === state.realm && !state.arriving
+          ? state.sections : (await api('/api/sections?realm=' + wanted)).sections);
       } catch { /* a new folder can still be named */ }
+      if (wanted !== realm) return;     // the other wall's folders are wanted by now
       folder.textContent = '';
       const add = (value, label) => { const o = el('option', '', label); o.value = value; folder.appendChild(o); return o; };
       add('', 'No folder (Unsorted)');
@@ -2871,12 +2955,20 @@
       fresh.hidden = folder.value !== '\n';
     };
     folder.addEventListener('change', () => {
+      chosen = true;
       fresh.hidden = folder.value !== '\n';
       if (!fresh.hidden) fresh.focus();
     });
     offer();
-    box.appendChild(option('Wall', segmented([['visible', 'Visible'], ['hidden', 'Hidden']], realm,
-      (picked) => { realm = picked; offer(); })));
+    const walls = segmented([['visible', 'Visible'], ['hidden', 'Hidden']], realm,
+      (picked) => { chosen = true; realm = picked; offer(); });
+    up.follow = () => {
+      if (chosen || picking) return;
+      realm = state.realm;
+      walls.show(realm);
+      offer();
+    };
+    box.appendChild(option('Wall', walls));
     box.appendChild(option('Folder', folder));
     box.appendChild(fresh);
     const note = el('p', 'error');
@@ -2899,9 +2991,12 @@
           fresh.focus();
           return;
         }
+        picking = true;
         input.click();
       });
+      input.addEventListener('cancel', () => { picking = false; });
       input.addEventListener('change', () => {
+        chosen = true;
         const typed = folder.value === '\n' ? fresh.value : folder.value;
         const where = typed.split('/').map((part) => part.trim()).filter(Boolean).join('/');
         up.realm = realm;
